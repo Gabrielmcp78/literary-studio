@@ -27,26 +27,32 @@ server with the IDE or desktop agent that supports MCP:
 }
 ```
 
-The available tools (bridge v1.1.0) are:
+The available tools (bridge v1.2.0) are:
 
 Read-only orientation:
 
-- `studio_list_projects`: project ids, titles, branch, commit, dirty state. Call first.
+- `studio_list_projects`: project ids, aliases (including FictionForce names), branch, commit, dirty state. Call first. Any tool's `project_id` accepts an id, title, or FictionForce name.
 - `studio_get_project`: full source pinning for one project.
 - `studio_get_story_map`: chapters → scenes with word counts, pressure scores, tracked entities.
 - `studio_read_scene`: one scene as plain text, each paragraph prefixed with its paragraph id.
 - `studio_list_personas`: personas and panels usable as `persona_ids`.
 - `studio_list_annotations`: the author's margin notes on a scene.
+- `studio_get_proposal_history`: what the author accepted and rejected, to learn their taste.
+
+Author-facing, non-editing:
+
+- `studio_add_question`: leave a margin question on one paragraph when a change needs the author's decision.
 
 Approval workflow:
 
-- `studio_prepare_for_approval`: prepare proposals from an author request.
+- `studio_prepare_for_approval`: prepare validated proposals from an author request; `panel_id` runs a persona panel in one batch.
 - `studio_list_pending_proposals`: list the project's staged proposals.
 - `studio_get_approval_batch`: retrieve a batch and its evidence baseline.
 - `studio_check_approval_conflicts`: verify that manual/Git edits have not made a batch stale.
 
 Accepting or rejecting proposals is intentionally not exposed: the Approval
-Desk is the author's gate.
+Desk is the author's gate. Validation, staleness, and write-back rules are in
+`docs/GOVERNANCE.md`.
 
 Errors (unknown project, API down, bad input) come back as MCP tool results with
 `isError: true` and a readable message; the server stays running. Set

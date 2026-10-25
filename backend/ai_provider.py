@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +32,16 @@ class AIProviderUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class AIResponse:
+    """A provider reply plus provenance.
+
+    ``fallback_reasons`` lists why earlier providers in the chain were skipped,
+    so a batch records the provider that actually ran and why.
+    """
+
     text: str
     provider: str
     model: str
+    fallback_reasons: tuple[str, ...] = ()
 
 
 def _executable(
@@ -137,7 +144,7 @@ def _run_agy(prompt: str) -> AIResponse:
         text = raw
     if not text.strip():
         raise AIProviderUnavailable("AGY fallback returned an empty response.")
-    return AIResponse(text=text.strip(), provider="agy", model=configured_model or "agy")
+    return AIResponse(text=text.strip(), provider="agy", model=configured_model or "agy CLI default model")
 
 
 def _run_fmod(prompt: str, system_instruction: str | None = None) -> AIResponse:
@@ -233,13 +240,17 @@ def generate_text(
     errors: list[str] = []
     if primary_error:
         errors.append(f"Gemini: {primary_error}")
+    elif genai is None or types is None:
+        errors.append("Gemini: google-genai is not installed.")
+    else:
+        errors.append("Gemini: GEMINI_API_KEY / GOOGLE_API_KEY is not set for the backend.")
     for fallback in (
         lambda: _run_agy(prompt),
         lambda: _run_fmod(prompt, system_instruction),
         lambda: _run_ollama(prompt, system_instruction),
     ):
         try:
-            return fallback()
+            return replace(fallback(), fallback_reasons=tuple(errors))
         except AIProviderUnavailable as exc:
             errors.append(str(exc))
     raise AIProviderUnavailable("; ".join(errors))

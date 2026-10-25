@@ -1,0 +1,7 @@
+# Literary Studio backend. Python 3.12+ (developed on 3.14).
+# FastAPI web framework: https://fastapi.tiangolo.com/
+fastapi==0.162.0
+# ASGI server that runs the API: https://www.uvicorn.org/
+uvicorn==0.54.0
+# Gemini client, the primary AI provider: https://googleapis.github.io/python-genai/
+google-genai==2.33.0

@@ -40,18 +40,18 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 API_BASE = os.getenv("LITERARY_STUDIO_API_URL", "http://127.0.0.1:8000").rstrip("/")
 # Proposal preparation calls the configured AI provider and can run long.
 API_TIMEOUT = float(os.getenv("LITERARY_STUDIO_TIMEOUT", "600"))
 
-_PROJECT = {"project_id": {"type": "string", "description": "Literary Studio project id (see studio_list_projects)."}}
+_PROJECT = {"project_id": {"type": "string", "description": "Literary Studio project id, title, or FictionForce project name (see studio_list_projects)."}}
 _BATCH = {"batch_id": {"type": "string", "description": "Approval batch id returned by studio_prepare_for_approval."}}
 
 TOOLS = [
     {
         "name": "studio_list_projects",
-        "description": "List Literary Studio projects with their ids, titles, source branch, commit, and whether the source checkout has uncommitted changes. Call this first to get a valid project_id.",
+        "description": "List Literary Studio projects with ids, aliases (including the matching FictionForce project name), source branch, commit, and dirty state; also FictionForce projects not yet in the Studio. Call this first.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -113,8 +113,37 @@ TOOLS = [
                 "chapter_numbers": {"type": "array", "items": {"type": "integer"}},
                 "include": {"type": "array", "items": {"type": "string"}, "description": "Context lenses, e.g. plot, character, subtext, causality, documentation."},
                 "persona_ids": {"type": "array", "items": {"type": "string"}, "description": "From studio_list_personas."},
+                "panel_id": {"type": "string", "description": "A persona panel from studio_list_personas, e.g. editorial_workshop; its personas compete in one batch."},
             },
             "required": ["project_id", "request_text"],
+        },
+    },
+    {
+        "name": "studio_add_question",
+        "description": "Leave the author a margin question on one paragraph (an annotation). Use this instead of a proposal when a change needs the author's decision. Never edits prose.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_PROJECT,
+                "scene_number": {"type": "integer"},
+                "paragraph_id": {"type": "string", "description": "Paragraph id from studio_read_scene."},
+                "question": {"type": "string"},
+                "quote_text": {"type": "string", "description": "Optional exact words the question is about."},
+            },
+            "required": ["project_id", "scene_number", "paragraph_id", "question"],
+        },
+    },
+    {
+        "name": "studio_get_proposal_history",
+        "description": "Proposals the author has already accepted or rejected, newest first, with the original request. Use it to learn the author's taste before preparing new proposals.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_PROJECT,
+                "status": {"type": "string", "enum": ["accepted", "rejected"]},
+                "limit": {"type": "integer", "description": "Default 30, max 200."},
+            },
+            "required": ["project_id"],
         },
     },
     {
@@ -129,7 +158,7 @@ TOOLS = [
     },
     {
         "name": "studio_check_approval_conflicts",
-        "description": "Check whether manual editing or Git changes made a prepared approval batch stale.",
+        "description": "Check, passage by passage, whether editing or Git changes made a prepared batch's staged proposals stale. Changed files with intact passages are warnings, not conflicts.",
         "inputSchema": {"type": "object", "properties": {**_PROJECT, **_BATCH}, "required": ["project_id", "batch_id"]},
     },
 ]
@@ -255,8 +284,15 @@ def call_tool(name: str, arguments: dict) -> object:
     Failure: ToolError for bad input or API failures.
     """
     if name == "studio_list_projects":
-        projects = _request("GET", "/api/projects")
-        return {"projects": [{k: p.get(k) for k in _PROJECT_FIELDS} for p in projects]}
+        registry = _request("GET", "/api/registry")
+        return {
+            "projects": [
+                {**{k: p.get(k) for k in _PROJECT_FIELDS}, "aliases": p.get("aliases", []),
+                 "fictionforce_project": p.get("fictionforce_project")}
+                for p in registry.get("projects", [])
+            ],
+            "fictionforce_only": registry.get("fictionforce_only", []),
+        }
 
     pid = _seg(_require(arguments, "project_id"))
     base = f"/api/projects/{pid}"
@@ -341,8 +377,31 @@ def call_tool(name: str, arguments: dict) -> object:
             "chapter_numbers": arguments.get("chapter_numbers") or [],
             "include": arguments.get("include") or [],
             "persona_ids": arguments.get("persona_ids") or [],
+            "panel_id": (arguments.get("panel_id") or None),
         }
         return _request("POST", f"{base}/approval-batches", payload)
+
+    if name == "studio_add_question":
+        number = _require(arguments, "scene_number", int)
+        payload = {
+            "paragraph_id": _require(arguments, "paragraph_id"),
+            "quote_text": str(arguments.get("quote_text") or ""),
+            "body": _require(arguments, "question"),
+            "category": "question",
+        }
+        return _request("POST", f"{base}/scenes/{_seg(number)}/annotations", payload)
+
+    if name == "studio_get_proposal_history":
+        limit = max(1, min(int(arguments.get("limit") or 30), 200))
+        status = arguments.get("status")
+        query = f"?limit={limit}" + (f"&status={quote(str(status), safe='')}" if status else "")
+        rows = _request("GET", f"{base}/governance/history{query}")
+        return {"proposals": [
+            {k: r.get(k) for k in ("proposal_id", "status", "writeback_status", "reviewed_at", "scene_number",
+                                   "change_type", "proposed_by_name", "original_verbatim_text",
+                                   "proposed_replacement_text", "editorial_rationale", "batch_request_text")}
+            for r in rows
+        ]}
 
     if name == "studio_list_pending_proposals":
         return {"project_id": arguments["project_id"], "proposals": _request("GET", f"{base}/governance/proposals")}

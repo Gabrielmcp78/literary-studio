@@ -13,7 +13,7 @@ import json
 import re
 import sqlite3
 from uuid import uuid4
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from html import escape
@@ -57,6 +57,37 @@ def html_to_text(value: str) -> str:
     text = "".join(parser.parts)
     text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def unique_html_anchor(content_html: str, original: str) -> str | None:
+    """Return the HTML spelling of ``original`` that occurs exactly once, else None.
+
+    Scene HTML stores text escaped (``&amp;``), so both the raw and escaped
+    forms are tried. None means the text is absent, repeated, or interrupted
+    by inline markup (italics, bold, links) and cannot be replaced exactly.
+    """
+    if not original:
+        return None
+    for candidate in dict.fromkeys((original, escape(original, quote=False))):
+        if content_html.count(candidate) == 1:
+            return candidate
+    return None
+
+
+_BLOCK_WITHOUT_ID = re.compile(r"<(p|h[1-6]|blockquote|li)(?![^>]*\bdata-id=)(\s[^>]*)?>", re.IGNORECASE)
+
+
+def assign_block_ids(content_html: str) -> str:
+    """Give every paragraph-level block a ``data-id`` UUID if it lacks one.
+
+    Matches the editor's TipTap UniqueID extension (types paragraph, heading,
+    blockquote, listItem; attribute data-id; UUID v4), which keeps existing ids,
+    so annotations can anchor to scenes that have never been opened in the
+    editor. Text content is unchanged.
+    """
+    return _BLOCK_WITHOUT_ID.sub(
+        lambda m: f'<{m.group(1)} data-id="{uuid4()}"{m.group(2) or ""}>', content_html
+    )
 
 
 def words(value: str) -> list[str]:
@@ -508,9 +539,21 @@ class StudioDB:
                 ("source_commit_sha", "TEXT"),
                 ("source_digest", "TEXT"),
                 ("source_scene_version", "INTEGER"),
+                ("validation_json", "TEXT"),
+                ("writeback_status", "TEXT"),
+                ("reviewed_at", "TEXT"),
             ):
                 if column not in proposal_columns:
                     connection.execute(f"ALTER TABLE proposals ADD COLUMN {column} {definition}")
+            batch_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(approval_batches)").fetchall()
+            }
+            for column, definition in (
+                ("writeback_json", "TEXT"),
+                ("result_json", "TEXT"),
+            ):
+                if column not in batch_columns:
+                    connection.execute(f"ALTER TABLE approval_batches ADD COLUMN {column} {definition}")
             scene_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(scenes)").fetchall()
             }
@@ -531,6 +574,14 @@ class StudioDB:
             ):
                 if column not in annotation_columns:
                     connection.execute(f"ALTER TABLE annotations ADD COLUMN {column} {definition}")
+            # One-time, text-neutral backfill of block ids (see assign_block_ids).
+            for row in connection.execute("SELECT scene_number, content_html FROM scenes").fetchall():
+                with_ids = assign_block_ids(row["content_html"])
+                if with_ids != row["content_html"]:
+                    connection.execute(
+                        "UPDATE scenes SET content_html = ? WHERE scene_number = ?",
+                        (with_ids, row["scene_number"]),
+                    )
             scene_rows = connection.execute(
                 "SELECT scene_number, content_html, version, updated_at FROM scenes"
             ).fetchall()
@@ -660,6 +711,12 @@ class StudioDB:
         except (KeyError, json.JSONDecodeError):
             batch["include"] = []
             batch["baseline"] = {}
+        for column, key in (("writeback_json", "writeback"), ("result_json", "result")):
+            raw = batch.pop(column, None)
+            try:
+                batch[key] = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                batch[key] = {}
         batch["proposals"] = self.batch_proposals(batch_id)
         return batch
 
@@ -669,7 +726,67 @@ class StudioDB:
                 "SELECT * FROM proposals WHERE batch_id = ? ORDER BY scene_number, proposal_id",
                 (batch_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._proposal(row) for row in rows]
+
+    @staticmethod
+    def _proposal(row: sqlite3.Row) -> dict[str, Any]:
+        proposal = dict(row)
+        raw = proposal.pop("validation_json", None)
+        try:
+            proposal["validation"] = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            proposal["validation"] = None
+        return proposal
+
+    def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+        return self._proposal(row) if row else None
+
+    def update_approval_batch(
+        self,
+        batch_id: str,
+        *,
+        status: str | None = None,
+        writeback: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        """Update a batch's status, write-back ledger, or preparation result."""
+        assignments: list[str] = []
+        values: list[Any] = []
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if writeback is not None:
+            assignments.append("writeback_json = ?")
+            values.append(json.dumps(writeback, ensure_ascii=False))
+        if result is not None:
+            assignments.append("result_json = ?")
+            values.append(json.dumps(result, ensure_ascii=False))
+        if not assignments:
+            return
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                f"UPDATE approval_batches SET {', '.join(assignments)} WHERE batch_id = ?",
+                (*values, batch_id),
+            )
+
+    def proposal_history(self, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
+        """Reviewed proposals, newest first, with their batch request for context."""
+        query = """SELECT p.*, b.request_text AS batch_request_text
+                   FROM proposals p LEFT JOIN approval_batches b ON b.batch_id = p.batch_id
+                   WHERE p.status != 'staged'"""
+        params: list[Any] = []
+        if status:
+            query += " AND p.status = ?"
+            params.append(status)
+        query += " ORDER BY COALESCE(p.reviewed_at, '') DESC, p.proposal_id LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._proposal(row) for row in rows]
 
     def create_staged_proposal(
         self,
@@ -686,6 +803,7 @@ class StudioDB:
         source_commit_sha: str | None,
         source_digest: str | None,
         source_scene_version: int,
+        validation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         proposal = {
             "proposal_id": f"prop_{uuid4().hex}",
@@ -702,6 +820,7 @@ class StudioDB:
             "source_digest": source_digest,
             "source_scene_version": source_scene_version,
             "status": "staged",
+            "validation": validation,
         }
         with self._lock, self._connect() as connection:
             connection.execute(
@@ -709,14 +828,15 @@ class StudioDB:
                     proposal_id, batch_id, scene_number, proposed_by_persona_id,
                     proposed_by_name, change_type, original_verbatim_text,
                     proposed_replacement_text, editorial_rationale, source_branch,
-                    source_commit_sha, source_digest, source_scene_version, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                tuple(proposal[key] for key in (
+                    source_commit_sha, source_digest, source_scene_version, status,
+                    validation_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*tuple(proposal[key] for key in (
                     "proposal_id", "batch_id", "scene_number", "proposed_by_persona_id",
                     "proposed_by_name", "change_type", "original_verbatim_text",
                     "proposed_replacement_text", "editorial_rationale", "source_branch",
                     "source_commit_sha", "source_digest", "source_scene_version", "status",
-                )),
+                )), json.dumps(validation, ensure_ascii=False) if validation is not None else None),
             )
         return proposal
 
@@ -880,6 +1000,7 @@ class StudioDB:
             for offset, section in enumerate(sections):
                 scene_number = next_scene_number + offset
                 imported_numbers.append(scene_number)
+                section = replace(section, content_html=assign_block_ids(section.content_html))
                 connection.execute(
                     """INSERT INTO scenes(
                         scene_number, title, content_html, chapter_number, chapter_title,
@@ -921,7 +1042,7 @@ class StudioDB:
             rows = connection.execute(
                 "SELECT * FROM proposals WHERE status = 'staged' ORDER BY scene_number, proposal_id"
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [self._proposal(row) for row in rows]
 
     @staticmethod
     def _annotation(row: sqlite3.Row) -> dict[str, Any]:
@@ -1054,7 +1175,18 @@ class StudioDB:
             ).fetchone()
             return self._annotation(updated)
 
-    def review_proposal(self, proposal_id: str, action: str) -> dict[str, Any]:
+    def review_proposal(
+        self, proposal_id: str, action: str, writeback_status: str | None = None
+    ) -> dict[str, Any]:
+        """Accept or reject a staged proposal.
+
+        Accepting replaces the proposal's original text in the Studio scene.
+        Staleness is per passage: the original must still appear exactly once
+        (sibling proposals in the same scene stay valid). ``writeback_status``
+        records whether the Markdown source was also patched.
+        Failure: KeyError (unknown proposal); ValueError (already reviewed,
+        scene gone, or passage no longer unique).
+        """
         with self._lock, self._connect() as connection:
             proposal = connection.execute(
                 "SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)
@@ -1071,17 +1203,10 @@ class StudioDB:
                 ).fetchone()
                 if not scene:
                     raise ValueError("The proposal scene no longer exists.")
-                if (
-                    proposal["source_scene_version"] is not None
-                    and int(scene["version"]) != int(proposal["source_scene_version"])
-                ):
-                    raise ValueError("The scene changed after this proposal was prepared.")
                 current = scene["content_html"]
-                original = proposal["original_verbatim_text"]
-                anchors = (original, escape(original, quote=False))
-                anchor = next((candidate for candidate in anchors if candidate in current), None)
+                anchor = unique_html_anchor(current, proposal["original_verbatim_text"])
                 if anchor is None:
-                    raise ValueError("The proposal anchor is not present in the current scene.")
+                    raise ValueError("The proposal's original text is no longer present exactly once in the scene.")
                 replacement = escape(proposal["proposed_replacement_text"], quote=False)
                 updated = current.replace(anchor, replacement, 1)
                 now = utc_now()
@@ -1122,8 +1247,8 @@ class StudioDB:
 
             new_status = "accepted" if action == "accept" else "rejected"
             connection.execute(
-                "UPDATE proposals SET status = ? WHERE proposal_id = ?",
-                (new_status, proposal_id),
+                "UPDATE proposals SET status = ?, writeback_status = ?, reviewed_at = ? WHERE proposal_id = ?",
+                (new_status, writeback_status if action == "accept" else None, utc_now(), proposal_id),
             )
             return {"proposal_id": proposal_id, "new_status": new_status}
 
@@ -1190,8 +1315,12 @@ class StudioDB:
     def telemetry(self) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
             totals = connection.execute(
-                "SELECT COALESCE(SUM(words_added), 0), COALESCE(SUM(words_deleted), 0) FROM telemetry_events"
+                """SELECT COALESCE(SUM(words_added), 0), COALESCE(SUM(words_deleted), 0)
+                   FROM telemetry_events WHERE event_type != 'manuscript_imported'"""
             ).fetchone()
+            imported = connection.execute(
+                "SELECT COALESCE(SUM(words_added), 0) FROM telemetry_events WHERE event_type = 'manuscript_imported'"
+            ).fetchone()[0]
             latest = connection.execute(
                 "SELECT scene_number, summary, created_at FROM telemetry_events ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -1204,6 +1333,7 @@ class StudioDB:
             "net_word_change": added - deleted,
             "words_added": added,
             "words_deleted": deleted,
+            "imported_words": int(imported),
             "active_plot_tags": [
                 f"#scene:{latest['scene_number']}" if latest else "#scene:none",
                 "#graph:story-bible",

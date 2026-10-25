@@ -8,8 +8,8 @@ import re
 from typing import Any
 
 from ai_provider import AIProviderUnavailable, generate_text
-from persona_catalog import get_persona
-from source_snapshot import SnapshotError, build_snapshot
+from governance import GovernanceError, check_batch, current_source_state, prose_law_status, validate_candidate
+from persona_catalog import get_panel, get_persona
 from studio_db import StudioDB, html_to_text
 
 
@@ -36,93 +36,12 @@ def _parse_json(raw_text: str) -> dict[str, Any]:
     return parsed
 
 
-def current_source_state(db: StudioDB) -> dict[str, Any]:
-    """Read current Git provenance without changing the checkout."""
-    project = db.project_info()
-    state = {
-        "source_root": project.get("source_root"),
-        "source_subpath": project.get("source_subpath"),
-        "branch": project.get("branch"),
-        "commit_sha": project.get("commit_sha"),
-        "source_digest": project.get("source_digest"),
-        "working_tree_dirty": bool(project.get("working_tree_dirty")),
-        "read_status": "project_snapshot",
-    }
-    source_root = project.get("source_root")
-    if not source_root:
-        return state
+def check_approval_conflicts(db: StudioDB, batch_id: str, proposal_id: str | None = None) -> dict[str, Any]:
+    """Per-passage staleness check for a batch (see governance.check_batch)."""
     try:
-        snapshot = build_snapshot(
-            project["project_id"],
-            project["title"],
-            source_root,
-            project.get("source_subpath"),
-        )
-    except SnapshotError as exc:
-        state["read_status"] = "source_unavailable"
-        state["read_error"] = str(exc)
-        return state
-    manifest = snapshot["manifest"]
-    state.update(
-        {
-            "branch": manifest["branch"],
-            "commit_sha": manifest["commit_sha"],
-            "source_digest": manifest["source_digest"],
-            "working_tree_dirty": manifest["working_tree_dirty"],
-            "read_status": "live_worktree",
-        }
-    )
-    return state
-
-
-def check_approval_conflicts(db: StudioDB, batch_id: str) -> dict[str, Any]:
-    batch = db.get_approval_batch(batch_id)
-    if batch is None:
-        raise ApprovalBridgeError("Approval batch not found.")
-    baseline = batch.get("baseline", {})
-    current = current_source_state(db)
-    conflicts: list[dict[str, Any]] = []
-    for key in ("branch", "commit_sha", "source_digest"):
-        expected = baseline.get(key)
-        actual = current.get(key)
-        if expected and actual and expected != actual:
-            conflicts.append(
-                {
-                    "kind": "source_drift",
-                    "field": key,
-                    "expected": expected,
-                    "actual": actual,
-                    "message": f"{key} changed after this approval batch was prepared.",
-                }
-            )
-    for proposal in batch.get("proposals", []):
-        scene = db.get_scene(int(proposal["scene_number"]))
-        if scene is None:
-            conflicts.append(
-                {
-                    "kind": "scene_missing",
-                    "proposal_id": proposal["proposal_id"],
-                    "scene_number": proposal["scene_number"],
-                }
-            )
-        elif proposal.get("source_scene_version") is not None and int(scene["version"]) != int(proposal["source_scene_version"]):
-            conflicts.append(
-                {
-                    "kind": "scene_changed",
-                    "proposal_id": proposal["proposal_id"],
-                    "scene_number": proposal["scene_number"],
-                    "expected_version": proposal["source_scene_version"],
-                    "actual_version": scene["version"],
-                    "message": "The scene was edited after this proposal was prepared.",
-                }
-            )
-    return {
-        "batch_id": batch_id,
-        "safe_to_apply": not conflicts,
-        "baseline": baseline,
-        "current": current,
-        "conflicts": conflicts,
-    }
+        return check_batch(db, batch_id, proposal_id)
+    except GovernanceError as exc:
+        raise ApprovalBridgeError(str(exc)) from exc
 
 
 def prepare_for_approval(
@@ -133,7 +52,19 @@ def prepare_for_approval(
     chapter_numbers: list[int] | None = None,
     include: list[str] | None = None,
     persona_ids: list[str] | None = None,
+    panel_id: str | None = None,
 ) -> dict[str, Any]:
+    """Turn an author request into validated, source-pinned proposals.
+
+    Parameters: scene_numbers/chapter_numbers - scope (empty = whole manuscript,
+    max 80 scenes); include - context lenses; persona_ids and/or panel_id -
+    editorial voices.
+    Behavior: pins the live branch, commit, and per-file digests; asks the AI
+    provider for proposals; stages only candidates that pass governance
+    validation; persists summary, questions, rejections, and provenance.
+    Failure: ApprovalBridgeError for empty request/scope, unknown panel,
+    provider unavailability, or unparseable AI output.
+    """
     request_text = request_text.strip()
     if not request_text:
         raise ApprovalBridgeError("Approval preparation requires a change request.")
@@ -153,14 +84,24 @@ def prepare_for_approval(
         raise ApprovalBridgeError("Approval preparation is limited to 80 scenes per batch; narrow the scope.")
 
     project = db.project_info()
+    live = current_source_state(db)
+    scene_paths = {scene.get("source_path") for scene in selected if scene.get("source_path")}
     baseline = {
-        "branch": project.get("branch"),
-        "commit_sha": project.get("commit_sha"),
-        "source_digest": project.get("source_digest"),
+        "branch": live.get("branch"),
+        "commit_sha": live.get("commit_sha"),
+        "source_digest": live.get("source_digest"),
+        "read_status": live.get("read_status"),
         "scene_versions": {str(scene["scene_number"]): scene["version"] for scene in selected},
+        "file_digests": {path: digest for path, digest in live.get("file_digests", {}).items() if path in scene_paths},
     }
+    persona_ids = list(persona_ids or [])
+    if panel_id:
+        panel = get_panel(panel_id)
+        if panel is None:
+            raise ApprovalBridgeError(f"Unknown persona panel: {panel_id}.")
+        persona_ids += [pid for pid in panel.get("persona_ids", []) if pid not in persona_ids]
     persona_context: list[dict[str, str]] = []
-    for persona_id in persona_ids or []:
+    for persona_id in persona_ids:
         persona = get_persona(persona_id)
         if persona:
             persona_context.append(
@@ -185,9 +126,20 @@ def prepare_for_approval(
     prompt = f"""
 You are the Literary Studio approval-preparation editor. Turn the author's request
 into exact, reviewable manuscript proposals. Do not apply changes. Do not invent
-facts. Every original_verbatim_text must be copied exactly from one supplied scene,
-must be short and contiguous, and must be replaced only in that scene. If a change
-is uncertain, put it in questions instead of creating a proposal.
+facts. If a change is uncertain, put it in questions instead of creating a proposal.
+
+Every proposal is machine-checked and discarded if it breaks these rules:
+- original_verbatim_text is copied character-for-character from one supplied scene,
+  is contiguous, stays inside one paragraph, and occurs exactly once in that scene
+  (include enough surrounding words to make it unique).
+- Do not start or end a span inside italic or bold text.
+- The replacement keeps quotation marks and brackets balanced: if you move dialogue,
+  carry both its opening and closing quotation marks.
+- The replacement must not introduce prose-law violations: binary-negative cadence
+  ("Not X. Not Y.", "not as X, not as Y"), more em-dashes, three consecutive
+  fragments of three words or fewer, or two spaces after sentence punctuation.
+- When persona lenses are supplied, set proposed_by_persona_id and proposed_by_name
+  to the persona whose lens the proposal comes from.
 
 Return JSON only:
 {{
@@ -228,6 +180,7 @@ SOURCE-PINNED SCENE EVIDENCE:
         raise ApprovalBridgeError(str(exc)) from exc
     parsed = _parse_json(response.text)
     batch = db.create_approval_batch(request_text, include, baseline)
+    persona_names = {item["persona_id"]: item["name"] for item in persona_context}
     valid_scene_numbers = {scene["scene_number"] for scene in selected}
     by_scene = {scene["scene_number"]: scene for scene in selected}
     staged: list[dict[str, Any]] = []
@@ -250,34 +203,45 @@ SOURCE-PINNED SCENE EVIDENCE:
         if not original or not replacement.strip() or original == replacement:
             rejected.append({"candidate": candidate, "reason": "Proposal has an empty or unchanged text span."})
             continue
-        if original not in html_to_text(scene["content_html"]):
-            rejected.append({"candidate": candidate, "reason": "Exact text anchor was not found in the imported scene."})
+        validation = validate_candidate(project, scene, original, replacement)
+        if validation["errors"]:
+            rejected.append({"candidate": candidate, "reason": " ".join(validation["errors"]), "validation": validation})
             continue
+        persona_id = str(candidate.get("proposed_by_persona_id") or "").strip()
+        if persona_id not in persona_names:
+            persona_id = "studio_command_bridge"
         staged.append(
             db.create_staged_proposal(
                 batch_id=batch["batch_id"],
                 scene_number=scene_number,
-                proposed_by_persona_id=str(candidate.get("proposed_by_persona_id") or "studio_command_bridge"),
-                proposed_by_name=str(candidate.get("proposed_by_name") or response.provider.title()),
+                proposed_by_persona_id=persona_id,
+                proposed_by_name=persona_names.get(persona_id, "Studio Bridge"),
                 change_type=str(candidate.get("change_type") or "other"),
                 original_verbatim_text=original,
                 proposed_replacement_text=replacement,
                 editorial_rationale=str(candidate.get("editorial_rationale") or "Prepared for author review."),
-                source_branch=project.get("branch"),
-                source_commit_sha=project.get("commit_sha"),
-                source_digest=project.get("source_digest"),
+                source_branch=baseline.get("branch"),
+                source_commit_sha=baseline.get("commit_sha"),
+                source_digest=baseline.get("source_digest"),
                 source_scene_version=int(scene["version"]),
+                validation=validation,
             )
         )
-    batch = db.get_approval_batch(batch["batch_id"]) or batch
-    batch.update(
-        {
-            "summary": str(parsed.get("summary") or "Approval proposals prepared."),
-            "questions": [str(item) for item in parsed.get("questions", []) if str(item).strip()],
-            "rejected": rejected,
+    result = {
+        "summary": str(parsed.get("summary") or "Approval proposals prepared."),
+        "questions": [str(item) for item in parsed.get("questions", []) if str(item).strip()],
+        "rejected": rejected,
+        "provenance": {
             "provider": response.provider,
             "model": response.model,
-            "proposals": staged,
-        }
-    )
+            "fallback_reasons": list(response.fallback_reasons),
+            "persona_ids": persona_ids,
+            "panel_id": panel_id,
+            "prose_law": prose_law_status(),
+        },
+    }
+    db.update_approval_batch(batch["batch_id"], result=result, status="pending" if staged else "closed")
+    batch = db.get_approval_batch(batch["batch_id"]) or batch
+    batch.update(result)
+    batch["provider"], batch["model"] = response.provider, response.model
     return batch

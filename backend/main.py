@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from ai_provider import AIProviderUnavailable, generate_text
 from approval_bridge import ApprovalBridgeError, check_approval_conflicts, prepare_for_approval
 from compiler_engine import compile_shunn_pdf
+from governance import GovernanceError, commit_batch, finalize_batch_if_done, record_write, restore, write_back
 from context_package import CONTEXT_OPTIONS, ContextPackageError, build_context_package
 from intake_audit import run_intake_audit
 from manuscript_context import ManuscriptContextError, build_interrogation_context, context_prompt, manuscript_index
@@ -27,7 +28,7 @@ from source_snapshot import SnapshotError, build_snapshot, write_snapshot
 from studio_db import PROJECTS_ROOT, StudioDB, html_to_text, utc_now
 
 
-app = FastAPI(title="Literary Studio API", version="1.0.0")
+app = FastAPI(title="Literary Studio API", version="1.1.0")
 project_manager = ProjectManager()
 project_manager.ensure_default_project()
 
@@ -41,10 +42,17 @@ app.add_middleware(
 
 
 def get_project_db(project_id: str) -> StudioDB:
+    """Open a project by Studio id, title, slug, or FictionForce name."""
     try:
-        return project_manager.open(project_id)
+        return project_manager.open(project_manager.resolve(project_id))
     except ProjectNotFound as exc:
         raise HTTPException(status_code=404, detail="Project not found.") from exc
+
+
+@app.get("/api/registry")
+def project_registry():
+    """Studio projects joined with FictionForce projects by manuscript root."""
+    return project_manager.registry()
 
 
 @app.get("/health")
@@ -109,6 +117,7 @@ class ApprovalPreparationRequest(BaseModel):
     chapter_numbers: List[int] = Field(default_factory=list)
     include: List[str] = Field(default_factory=list)
     persona_ids: List[str] = Field(default_factory=list)
+    panel_id: str | None = None
 
 
 @app.post("/api/projects/{project_id}/context-package")
@@ -143,13 +152,14 @@ def create_source_snapshot(project_id: str, req: SourceSnapshotRequest):
         )
     try:
         project = db.project_info()
+        canonical_id = project["project_id"]  # the URL may carry an alias
         snapshot = build_snapshot(
-            project_id,
+            canonical_id,
             project["title"],
             req.source_root,
             req.source_subpath,
         )
-        output_dir = PROJECTS_ROOT / project_id / "source"
+        output_dir = PROJECTS_ROOT / canonical_id / "source"
         snapshot_path, manifest_path = write_snapshot(snapshot, output_dir)
         if has_existing_scenes:
             db.reset_manuscript()
@@ -669,6 +679,7 @@ class InterrogationRequest(BaseModel):
     conversation_history: List[ChatMessage]
     user_message: str
     current_screen_text: str = ""
+    target_scope: Literal["screen", "scene", "chapter"] = "screen"
     target_chapter_number: int | None = None
     target_scene_number_in_chapter: int | None = None
     target_global_scene_number: int | None = None
@@ -682,6 +693,7 @@ def interrogation_chat_endpoint(project_id: str, req: InterrogationRequest):
             db,
             current_scene_number=req.scene_number,
             current_screen_text=req.current_screen_text,
+            target_scope=req.target_scope,
             target_chapter_number=req.target_chapter_number,
             target_scene_number_in_chapter=req.target_scene_number_in_chapter,
             target_global_scene_number=req.target_global_scene_number,
@@ -722,6 +734,7 @@ def interrogation_chat_endpoint(project_id: str, req: InterrogationRequest):
         "context": {
             "current_scene_number": context["current_screen"]["scene_number"],
             "target_label": context["target_label"],
+            "target_scope": context["target_scope"],
             "manuscript_scene_count": len(context["manuscript_index"]),
             "current_screen_source": context["current_screen"]["source"],
         },
@@ -737,7 +750,7 @@ class CompilerRequest(BaseModel):
 def export_shunn_pdf(project_id: str, req: CompilerRequest | None = None):
     db = get_project_db(project_id)
     output_filename = f"{project_id}_Shunn.pdf"
-    output_dir = PROJECTS_ROOT / project_id / "build_artifacts"
+    output_dir = PROJECTS_ROOT / get_project_db(project_id).project_info()["project_id"] / "build_artifacts"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = os.path.abspath(output_dir / output_filename)
 
@@ -770,6 +783,7 @@ def prepare_approval_batch(project_id: str, req: ApprovalPreparationRequest):
             chapter_numbers=req.chapter_numbers or None,
             include=req.include,
             persona_ids=req.persona_ids,
+            panel_id=req.panel_id,
         )
     except ApprovalBridgeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -781,6 +795,24 @@ def get_approval_batch(project_id: str, batch_id: str):
     if batch is None:
         raise HTTPException(status_code=404, detail="Approval batch not found.")
     return batch
+
+
+@app.post("/api/projects/{project_id}/approval-batches/{batch_id}/commit")
+def commit_approval_batch(project_id: str, batch_id: str):
+    """Commit a batch's written-back source files now (retry after a failure, or commit early)."""
+    try:
+        return commit_batch(get_project_db(project_id), batch_id)
+    except GovernanceError as exc:
+        status = 404 if exc.code == "not_found" else 409
+        raise HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/projects/{project_id}/governance/history")
+def proposal_history(project_id: str, limit: int = 50, status: str | None = None):
+    """Reviewed proposals, newest first; status may be 'accepted' or 'rejected'."""
+    if status not in (None, "accepted", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be 'accepted' or 'rejected'.")
+    return get_project_db(project_id).proposal_history(limit=limit, status=status)
 
 
 @app.post("/api/projects/{project_id}/approval-batches/{batch_id}/check")
@@ -924,36 +956,88 @@ SCENE {scene_number} — {scene["title"]}:
 
 class ReviewRequest(BaseModel):
     action: str
-    target_branch: str = "main"
+    # Accepted for client compatibility and ignored: edits go to the batch's pinned branch.
+    target_branch: str | None = None
+    # Accept into the Studio copy only, without patching the Markdown source.
+    studio_only: bool = False
+
+
+def _review_error(status: int, code: str, message: str, **extra) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": message, **extra})
 
 
 @app.post("/api/projects/{project_id}/governance/proposals/{proposal_id}/review")
 def review_proposal_endpoint(project_id: str, proposal_id: str, req: ReviewRequest):
+    """Accept or reject a staged proposal from the Approval Desk.
+
+    Accept: re-verifies this proposal's passage, patches the Markdown source on
+    the batch's pinned branch (unless studio_only), then updates the Studio
+    scene. If the database step fails the source file is restored. When the
+    batch's last proposal is reviewed, its source changes become one commit.
+    Errors carry {code, message}; code "writeback_blocked" means the author can
+    retry with studio_only.
+    """
     if req.action not in {"accept", "reject"}:
         raise HTTPException(status_code=400, detail="Action must be 'accept' or 'reject'.")
+    db = get_project_db(project_id)
+    proposal = db.get_proposal(proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="Proposal not found.")
+    if proposal["status"] != "staged":
+        raise _review_error(409, "already_reviewed", "Proposal has already been reviewed.")
+    batch_id = proposal.get("batch_id")
+
+    write = None
+    writeback_status = None
+    if req.action == "accept":
+        if batch_id:
+            report = check_approval_conflicts(db, batch_id, proposal_id)
+            if not report["safe_to_apply"]:
+                raise _review_error(
+                    409, "stale", "This proposal is stale and needs re-preparation.", conflicts=report["conflicts"]
+                )
+        scene = db.get_scene(int(proposal["scene_number"]))
+        if scene is None:
+            raise _review_error(409, "scene_missing", "The proposal scene no longer exists.")
+        if req.studio_only:
+            writeback_status = "studio_only"
+        else:
+            try:
+                write = write_back(db, proposal, scene)
+            except GovernanceError as exc:
+                raise _review_error(409, "writeback_blocked", str(exc), reason=exc.code, studio_only_available=True) from exc
+            writeback_status = "source_and_studio"
     try:
-        db = get_project_db(project_id)
-        if req.action == "accept":
-            proposal = next(
-                (item for item in db.staged_proposals() if item["proposal_id"] == proposal_id),
-                None,
-            )
-            if proposal and proposal.get("batch_id"):
-                conflict_report = check_approval_conflicts(db, proposal["batch_id"])
-                if not conflict_report["safe_to_apply"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Proposal is stale and needs review: {json.dumps(conflict_report['conflicts'], ensure_ascii=False)}",
-                    )
-        result = db.review_proposal(proposal_id, req.action)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Proposal not found.") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        result = db.review_proposal(proposal_id, req.action, writeback_status=writeback_status)
+    except (KeyError, ValueError) as exc:
+        if write:
+            restore(write)
+        raise _review_error(409, "review_failed", str(exc)) from exc
+    except Exception:
+        if write:
+            restore(write)
+        raise
+    if write and batch_id:
+        record_write(db, batch_id, proposal_id, write)
+    commit = finalize_batch_if_done(db, batch_id)
+
+    if req.action == "reject":
+        message = "Proposal rejected."
+    elif write:
+        message = f"Accepted and written to {write['path']}."
+    else:
+        message = "Accepted in the Studio copy only; the Markdown source was not changed."
+    if commit and commit.get("committed") and not commit.get("already"):
+        message += f" Batch committed as {commit['commit_sha'][:8]} on {commit.get('branch')}."
+    elif commit and commit.get("error"):
+        message += f" Batch commit failed: {commit['error']['message']}"
     return {
         "status": "success",
-        "project_id": project_id,
+        "project_id": db.project_info()["project_id"],
         "proposal_id": proposal_id,
         "new_status": result["new_status"],
-        "message": f"Proposal successfully {result['new_status']} on branch '{req.target_branch}'.",
+        "writeback_status": writeback_status,
+        "source_file": write["path"] if write else None,
+        "batch_commit": commit,
+        "message": message,
     }
