@@ -1,0 +1,2365 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>
+      Architectural Spec & System Modeler: Cloudflare Agents, MCP & Neo4j
+    </title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              brand: {
+                50: "#f0fdf4",
+                500: "#10b981",
+                600: "#059669",
+                900: "#064e3b",
+              },
+              cf: "#f38020",
+              mcp: "#8b5cf6",
+              neo: "#008cc1",
+              darkbg: "#0f172a",
+              darkcard: "#1e293b",
+              darkborder: "#334155",
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      /* Canvas styling and custom scrollbars */
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #0f172a;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #334155;
+        border-radius: 3px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #475569;
+      }
+
+      .grid-bg {
+        background-size: 24px 24px;
+        background-image:
+          linear-gradient(
+            to right,
+            rgba(51, 65, 85, 0.25) 1px,
+            transparent 1px
+          ),
+          linear-gradient(
+            to bottom,
+            rgba(51, 65, 85, 0.25) 1px,
+            transparent 1px
+          );
+      }
+
+      .node-glow-cf {
+        box-shadow: 0 0 15px -3px rgba(243, 128, 32, 0.3);
+      }
+      .node-glow-mcp {
+        box-shadow: 0 0 15px -3px rgba(139, 92, 246, 0.3);
+      }
+      .node-glow-neo {
+        box-shadow: 0 0 15px -3px rgba(0, 140, 193, 0.3);
+      }
+    </style>
+  </head>
+  <body
+    class="bg-darkbg text-slate-100 min-h-screen flex flex-col font-sans selection:bg-emerald-500 selection:text-white"
+  >
+    <!-- Header / Navigation Bar -->
+    <header
+      class="border-b border-darkborder bg-darkcard/80 backdrop-blur-md sticky top-0 z-50 px-6 py-3 flex items-center justify-between"
+    >
+      <div class="flex items-center space-x-3">
+        <div
+          class="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400"
+        >
+          <i data-lucide="cpu" class="w-6 h-6"></i>
+        </div>
+        <div>
+          <h1
+            class="text-lg font-bold tracking-tight text-white flex items-center gap-2"
+          >
+            Agentic Architecture Spec Studio
+            <span
+              class="text-xs px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-mono"
+              >v2.4 Spec</span
+            >
+          </h1>
+          <p class="text-xs text-slate-400">
+            Cloudflare Workflows vs. Local MCP Protocols vs. Neo4j Graph
+            Orchestration
+          </p>
+        </div>
+      </div>
+
+      <!-- View Switcher -->
+      <div
+        class="flex items-center bg-slate-900 border border-darkborder p-1 rounded-lg"
+      >
+        <button
+          id="tabDiagramBtn"
+          onclick="switchTab('diagram')"
+          class="flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-emerald-600 text-white transition shadow-sm"
+        >
+          <i data-lucide="network" class="w-4 h-4"></i>
+          <span>Interactive Canvas</span>
+        </button>
+        <button
+          id="tabSpecBtn"
+          onclick="switchTab('spec')"
+          class="flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold text-slate-400 hover:text-white transition"
+        >
+          <i data-lucide="file-spreadsheet" class="w-4 h-4"></i>
+          <span>Spec Sheet & Comparison</span>
+        </button>
+        <button
+          id="tabTopologyBtn"
+          onclick="switchTab('topology')"
+          class="flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold text-slate-400 hover:text-white transition"
+        >
+          <i data-lucide="layers" class="w-4 h-4"></i>
+          <span>Hybrid Architectures</span>
+        </button>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="flex items-center space-x-2">
+        <button
+          onclick="exportArchitectureJSON()"
+          class="text-xs flex items-center space-x-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-darkborder px-3 py-1.5 rounded transition"
+        >
+          <i data-lucide="download" class="w-3.5 h-3.5"></i>
+          <span>Export Spec</span>
+        </button>
+        <button
+          onclick="resetDefaultTopology()"
+          class="text-xs flex items-center space-x-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-darkborder px-3 py-1.5 rounded transition"
+        >
+          <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+          <span>Reset Model</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Notification Banner -->
+    <div
+      id="toastMessage"
+      class="fixed bottom-6 right-6 z-50 transform translate-y-20 opacity-0 transition-all duration-300 pointer-events-none bg-slate-900 border border-emerald-500/50 text-white px-4 py-2.5 rounded-lg shadow-xl flex items-center gap-2"
+    >
+      <i data-lucide="check-circle" class="w-4 h-4 text-emerald-400"></i>
+      <span id="toastText" class="text-xs font-medium">Notification</span>
+    </div>
+
+    <!-- Main Content Container -->
+    <main class="flex-1 flex overflow-hidden relative">
+      <!-- VIEW 1: INTERACTIVE DIAGRAM CANVAS -->
+      <div
+        id="view-diagram"
+        class="flex-1 flex flex-col md:flex-row w-full h-[calc(100vh-61px)]"
+      >
+        <!-- Left Tool Palette & Node Catalog -->
+        <aside
+          class="w-full md:w-80 bg-slate-900/90 border-r border-darkborder p-4 flex flex-col gap-4 overflow-y-auto shrink-0 z-10"
+        >
+          <div>
+            <h2
+              class="text-xs uppercase tracking-wider font-bold text-slate-400 mb-1"
+            >
+              Architecture Components
+            </h2>
+            <p class="text-xs text-slate-500">
+              Drag or click to spawn primitives onto the canvas.
+            </p>
+          </div>
+
+          <!-- Add Component Categories -->
+          <div class="space-y-3">
+            <!-- Cloudflare Agents -->
+            <div class="p-3 bg-darkcard rounded-lg border border-cf/30">
+              <div
+                class="flex items-center gap-2 text-cf font-semibold text-xs mb-2"
+              >
+                <i data-lucide="cloud-lightning" class="w-4 h-4"></i>
+                <span>Cloudflare Workflows / Edge</span>
+              </div>
+              <div class="grid grid-cols-1 gap-1.5">
+                <button
+                  onclick="addNodePreset('cf-agent')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Durable Object / Agent</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-cf"></i>
+                </button>
+                <button
+                  onclick="addNodePreset('cf-workflow')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Workflow Coordinator</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-cf"></i>
+                </button>
+                <button
+                  onclick="addNodePreset('cf-vectorize')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Vectorize & D1 Store</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-cf"></i>
+                </button>
+              </div>
+            </div>
+
+            <!-- Local MCP Server Ecosystem -->
+            <div class="p-3 bg-darkcard rounded-lg border border-mcp/30">
+              <div
+                class="flex items-center gap-2 text-mcp font-semibold text-xs mb-2"
+              >
+                <i data-lucide="terminal" class="w-4 h-4"></i>
+                <span>Local Model Context Protocol (MCP)</span>
+              </div>
+              <div class="grid grid-cols-1 gap-1.5">
+                <button
+                  onclick="addNodePreset('mcp-host')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>MCP Host Client (Claude/Cursor)</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-mcp"></i>
+                </button>
+                <button
+                  onclick="addNodePreset('mcp-server')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Local MCP Tool Server (Stdio/SSE)</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-mcp"></i>
+                </button>
+                <button
+                  onclick="addNodePreset('mcp-tunnel')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Cloudflare Tunnel / Bridge</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-mcp"></i>
+                </button>
+              </div>
+            </div>
+
+            <!-- Neo4j Knowledge Graph -->
+            <div class="p-3 bg-darkcard rounded-lg border border-neo/30">
+              <div
+                class="flex items-center gap-2 text-neo font-semibold text-xs mb-2"
+              >
+                <i data-lucide="share-2" class="w-4 h-4"></i>
+                <span>Neo4j Graph Database</span>
+              </div>
+              <div class="grid grid-cols-1 gap-1.5">
+                <button
+                  onclick="addNodePreset('neo-graph')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Neo4j Aura / Core Engine</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-neo"></i>
+                </button>
+                <button
+                  onclick="addNodePreset('neo-rag')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>GraphRAG Traversal Agent</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-neo"></i>
+                </button>
+                <button
+                  onclick="addNodePreset('neo-ontology')"
+                  class="text-left text-xs bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1.5 rounded border border-slate-700 text-slate-200 flex justify-between items-center transition"
+                >
+                  <span>Ontology & Entity Schema</span>
+                  <i data-lucide="plus" class="w-3 h-3 text-neo"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Canvas Controls -->
+          <div
+            class="mt-auto pt-3 border-t border-darkborder flex flex-col gap-2"
+          >
+            <div
+              class="flex items-center justify-between text-xs text-slate-400"
+            >
+              <span>Simulation Activity:</span>
+              <span id="simStatusBadge" class="text-emerald-400 font-mono"
+                >Running</span
+              >
+            </div>
+            <button
+              id="toggleSimBtn"
+              onclick="toggleSimulation()"
+              class="w-full text-xs font-semibold py-1.5 bg-slate-800 hover:bg-slate-700 border border-darkborder rounded text-slate-200 flex items-center justify-center gap-2 transition"
+            >
+              <i data-lucide="play" class="w-3.5 h-3.5"></i>
+              <span>Toggle Packet Flow</span>
+            </button>
+            <div class="text-[11px] text-slate-500 leading-snug">
+              Click any node on the canvas to inspect its telemetry, specs, and
+              connection endpoints. Drag nodes to customize.
+            </div>
+          </div>
+        </aside>
+
+        <!-- Center Interactive SVG / Canvas Work Area -->
+        <div
+          class="flex-1 relative bg-slate-950 grid-bg overflow-hidden flex flex-col"
+        >
+          <!-- Canvas Floating Controls Overlay -->
+          <div
+            class="absolute top-4 left-4 z-20 flex items-center gap-2 bg-darkcard/90 backdrop-blur border border-darkborder px-3 py-1.5 rounded-lg text-xs shadow-lg"
+          >
+            <span class="text-slate-400 font-medium">Active Preset:</span>
+            <select
+              id="topologyPresetSelect"
+              onchange="applyPresetTopology(this.value)"
+              class="bg-slate-900 border border-darkborder text-slate-200 rounded px-2 py-1 text-xs focus:ring-1 focus:ring-emerald-500 outline-none"
+            >
+              <option value="hybrid">
+                Unified Hybrid: Cloudflare + MCP + Neo4j
+              </option>
+              <option value="cf_pure">
+                Pure Cloudflare Edge Agent Cluster
+              </option>
+              <option value="mcp_local">
+                Local MCP Tool Harness + Desktop LLM
+              </option>
+              <option value="neo_graphrag">
+                GraphRAG & Knowledge Traversal
+              </option>
+            </select>
+          </div>
+
+          <!-- Connection Mode helper -->
+          <div
+            class="absolute top-4 right-4 z-20 flex items-center gap-2 bg-darkcard/90 backdrop-blur border border-darkborder px-3 py-1.5 rounded-lg text-xs shadow-lg"
+          >
+            <span
+              id="modeStatusIndicator"
+              class="flex items-center gap-1.5 text-slate-300"
+            >
+              <span
+                class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"
+              ></span>
+              Mode: Interactive Drag & Select
+            </span>
+          </div>
+
+          <!-- Interactive Diagram Surface -->
+          <div
+            id="canvasViewport"
+            class="flex-1 w-full h-full relative cursor-grab active:cursor-grabbing overflow-hidden"
+          >
+            <svg
+              id="networkSvg"
+              class="w-full h-full absolute inset-0 pointer-events-auto"
+            >
+              <defs>
+                <!-- Arrowheads -->
+                <marker
+                  id="arrow-cf"
+                  viewBox="0 0 10 10"
+                  refX="24"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#f38020" />
+                </marker>
+                <marker
+                  id="arrow-mcp"
+                  viewBox="0 0 10 10"
+                  refX="24"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#8b5cf6" />
+                </marker>
+                <marker
+                  id="arrow-neo"
+                  viewBox="0 0 10 10"
+                  refX="24"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#008cc1" />
+                </marker>
+                <marker
+                  id="arrow-default"
+                  viewBox="0 0 10 10"
+                  refX="24"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b" />
+                </marker>
+                <!-- Gradients for data packets -->
+                <radialGradient id="packetGrad" cx="50%" cy="50%" r="50%">
+                  <stop offset="0%" stop-color="#34d399" />
+                  <stop offset="100%" stop-color="#059669" />
+                </radialGradient>
+              </defs>
+              <g id="connectionsLayer"></g>
+              <g id="particlesLayer"></g>
+            </svg>
+
+            <!-- Nodes Container (HTML DOM elements for rich accessibility and styling) -->
+            <div
+              id="nodesContainer"
+              class="absolute inset-0 pointer-events-none"
+            ></div>
+          </div>
+        </div>
+
+        <!-- Right Detail / Node Inspector Panel -->
+        <aside
+          id="inspectorPanel"
+          class="w-full md:w-96 bg-slate-900 border-l border-darkborder p-5 flex flex-col gap-4 overflow-y-auto shrink-0 z-10"
+        >
+          <div
+            class="flex items-center justify-between pb-3 border-b border-darkborder"
+          >
+            <div class="flex items-center gap-2">
+              <div
+                id="inspectorIcon"
+                class="p-2 rounded bg-slate-800 text-emerald-400"
+              >
+                <i data-lucide="info" class="w-4 h-4"></i>
+              </div>
+              <div>
+                <h3 id="inspectorTitle" class="text-sm font-bold text-white">
+                  System Inspector
+                </h3>
+                <span
+                  id="inspectorCategory"
+                  class="text-[11px] text-slate-400 font-mono"
+                  >Select a component</span
+                >
+              </div>
+            </div>
+            <span
+              id="inspectorTier"
+              class="text-[10px] px-2 py-0.5 rounded uppercase font-bold tracking-wider bg-slate-800 text-slate-300"
+              >Spec</span
+            >
+          </div>
+
+          <!-- Node description & parameters -->
+          <div id="inspectorBody" class="space-y-4 text-xs">
+            <p class="text-slate-300 leading-relaxed">
+              Select any architecture block on the central interactive canvas to
+              view detailed operational specifications, protocol bindings, data
+              throughput characteristics, and security models.
+            </p>
+
+            <div
+              class="p-3 bg-darkcard rounded-lg border border-darkborder space-y-2"
+            >
+              <div
+                class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider"
+              >
+                Default Architecture Overview
+              </div>
+              <p class="text-slate-300">
+                This system diagram demonstrates how
+                <strong class="text-cf">Cloudflare Workflows</strong>
+                orchestrate edge ingress and state machines, bridged through
+                secure <strong class="text-mcp">Local MCP Servers</strong> for
+                direct hardware, database and runtime access, utilizing
+                <strong class="text-neo">Neo4j</strong> as the persistent
+                semantic GraphRAG memory layer.
+              </p>
+            </div>
+
+            <div class="border-t border-darkborder pt-3">
+              <h4 class="text-xs font-bold text-slate-200 mb-2">
+                Key Integration Invariants
+              </h4>
+              <ul class="space-y-2 text-slate-400">
+                <li class="flex items-start gap-2">
+                  <i
+                    data-lucide="check"
+                    class="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0"
+                  ></i>
+                  <span
+                    ><strong>Edge to Local:</strong> Cloudflare Tunnels
+                    (SSE/WebSocket) decouple public web endpoints from local MCP
+                    servers.</span
+                  >
+                </li>
+                <li class="flex items-start gap-2">
+                  <i
+                    data-lucide="check"
+                    class="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0"
+                  ></i>
+                  <span
+                    ><strong>Context Graph:</strong> Cypher queries enrich agent
+                    prompts with multi-hop relationships without vector
+                    hallucination.</span
+                  >
+                </li>
+                <li class="flex items-start gap-2">
+                  <i
+                    data-lucide="check"
+                    class="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0"
+                  ></i>
+                  <span
+                    ><strong>Execution Safety:</strong> Strict protocol schemas
+                    in JSON-RPC standard for MCP tool execution.</span
+                  >
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- Action / Editing buttons for selected node -->
+          <div
+            id="inspectorActions"
+            class="mt-auto pt-3 border-t border-darkborder flex flex-col gap-2"
+          >
+            <button
+              id="btnConnectFrom"
+              onclick="startNodeConnection()"
+              class="w-full text-xs font-semibold py-2 bg-emerald-600 hover:bg-emerald-500 rounded text-white flex items-center justify-center gap-1.5 transition"
+            >
+              <i data-lucide="link" class="w-3.5 h-3.5"></i>
+              <span>Create Outbound Link</span>
+            </button>
+            <button
+              id="btnDeleteNode"
+              onclick="deleteSelectedNode()"
+              class="w-full text-xs font-semibold py-1.5 bg-red-950/40 hover:bg-red-900/60 border border-red-800/40 rounded text-red-300 flex items-center justify-center gap-1.5 transition"
+            >
+              <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+              <span>Remove Component</span>
+            </button>
+          </div>
+        </aside>
+      </div>
+
+      <!-- VIEW 2: ARCHITECTURAL SPEC SHEET & MATRIX (Hidden by default) -->
+      <div
+        id="view-spec"
+        class="hidden flex-1 p-6 md:p-8 overflow-y-auto max-w-7xl mx-auto w-full"
+      >
+        <!-- Executive Summary Card -->
+        <div
+          class="mb-8 p-6 bg-darkcard rounded-xl border border-darkborder shadow-xl"
+        >
+          <div class="flex items-center justify-between mb-4 flex-wrap gap-4">
+            <div>
+              <h2 class="text-xl font-bold text-white flex items-center gap-2">
+                <i data-lucide="cpu" class="w-5 h-5 text-emerald-400"></i>
+                Comparative Architectural Analysis: Edge Agents vs. Local MCP
+                vs. Neo4j
+              </h2>
+              <p class="text-sm text-slate-400 mt-1">
+                High-order criteria, operational constraints, and orchestration
+                paradigms
+              </p>
+            </div>
+            <span
+              class="text-xs font-mono px-3 py-1 bg-emerald-950 border border-emerald-800 text-emerald-300 rounded-full"
+              >Production Benchmark 2026</span
+            >
+          </div>
+
+          <p class="text-sm text-slate-300 leading-relaxed">
+            Modern intelligent agent infrastructure must resolve the triangle
+            between
+            <strong class="text-cf"
+              >Edge Distributed Execution (Cloudflare)</strong
+            >,
+            <strong class="text-mcp"
+              >Local Environment & Hardware Control (Model Context
+              Protocol)</strong
+            >, and
+            <strong class="text-neo"
+              >Interconnected Knowledge Retrieval (Neo4j Graph Database)</strong
+            >. While Cloudflare minimizes latency at globally distributed
+            ingress points, local MCP enables local resource execution without
+            exposing internal networks, and Neo4j eliminates flat vector RAG
+            ambiguity by encoding structured schema logic.
+          </p>
+        </div>
+
+        <!-- Comparison Matrix Table -->
+        <div
+          class="mb-8 overflow-hidden rounded-xl border border-darkborder bg-darkcard shadow-lg"
+        >
+          <div
+            class="px-6 py-4 border-b border-darkborder flex items-center justify-between"
+          >
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+              <i data-lucide="table" class="w-4 h-4 text-emerald-400"></i>
+              Architectural Dimension Matrix
+            </h3>
+            <span class="text-xs text-slate-400"
+              >Direct parameter-to-parameter evaluation</span
+            >
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr
+                  class="bg-slate-900/90 text-slate-300 uppercase tracking-wider font-semibold border-b border-darkborder"
+                >
+                  <th class="p-4 w-1/5">Architectural Dimension</th>
+                  <th class="p-4 w-1/4 text-cf border-l border-darkborder">
+                    Cloudflare Agent Workflows
+                  </th>
+                  <th class="p-4 w-1/4 text-mcp border-l border-darkborder">
+                    Local MCP Servers (Anthropic Spec)
+                  </th>
+                  <th class="p-4 w-1/4 text-neo border-l border-darkborder">
+                    Neo4j Knowledge Graph
+                  </th>
+                </tr>
+              </thead>
+              <tbody
+                class="divide-y divide-darkborder font-normal text-slate-300"
+              >
+                <!-- Row 1: Execution Domain -->
+                <tr class="hover:bg-slate-800/40 transition">
+                  <td class="p-4 font-semibold text-white bg-slate-900/30">
+                    Execution Domain & Topology
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <span class="font-medium text-cf">Global Edge Network</span>
+                    (300+ PoPs). Serverless V8 isolates with millisecond cold
+                    starts.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <span class="font-medium text-mcp"
+                      >Local Host / Private Subnet</span
+                    >. Stdio pipe or localhost HTTP/SSE server.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <span class="font-medium text-neo"
+                      >Dedicated Graph Instance</span
+                    >
+                    (Aura Cloud or On-Prem Core Cluster).
+                  </td>
+                </tr>
+
+                <!-- Row 2: State Persistence -->
+                <tr class="hover:bg-slate-800/40 transition">
+                  <td class="p-4 font-semibold text-white bg-slate-900/30">
+                    State Persistence & Memory
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    Durable Objects (Single-instance coordination), KV, D1 (Edge
+                    SQLite), and Vectorize vector indices.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    Stateless standard invocation or local file persistence
+                    (SQLite, JSON, local git repos).
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    ACID property graph. Labeled Property Graph (LPG) with
+                    persistent entity-relationship index.
+                  </td>
+                </tr>
+
+                <!-- Row 3: Protocol & Transport -->
+                <tr class="hover:bg-slate-800/40 transition">
+                  <td class="p-4 font-semibold text-white bg-slate-900/30">
+                    Protocol & Transport Layer
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    HTTPS REST, WebSockets, gRPC, and Cloudflare Worker Queues /
+                    Workflow event buses.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    JSON-RPC 2.0 over standard input/output (<code
+                      class="bg-slate-800 px-1 py-0.5 rounded text-mcp"
+                      >stdio</code
+                    >) or Server-Sent Events (SSE).
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    Bolt Protocol (binary, multiplexed TCP over TLS) or Cypher
+                    over transactional HTTP endpoints.
+                  </td>
+                </tr>
+
+                <!-- Row 4: Latency Profile -->
+                <tr class="hover:bg-slate-800/40 transition">
+                  <td class="p-4 font-semibold text-white bg-slate-900/30">
+                    Latency Profile
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <span class="text-emerald-400 font-mono font-semibold"
+                      >&lt; 15ms</span
+                    >
+                    ingress; step sleep and automatic retry in long-running
+                    Workflows.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <span class="text-emerald-400 font-mono font-semibold"
+                      >&lt; 2ms</span
+                    >
+                    IPC via stdio; bound strictly by local disk/tool execution
+                    time.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <span class="text-amber-400 font-mono font-semibold"
+                      >10ms - 80ms</span
+                    >
+                    depending on multi-hop index traversal depth and graph size.
+                  </td>
+                </tr>
+
+                <!-- Row 5: Security & Isolation -->
+                <tr class="hover:bg-slate-800/40 transition">
+                  <td class="p-4 font-semibold text-white bg-slate-900/30">
+                    Security & Isolation Boundary
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    V8 sandbox boundary, Cloudflare Zero Trust, mTLS, WAF, Web
+                    Crypto API native primitives.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    Local process sandboxing (OS-level user permissions, Docker
+                    isolation, host permission prompts).
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    Role-based access control (RBAC), fine-grained
+                    node/relationship level security, TLS encryption.
+                  </td>
+                </tr>
+
+                <!-- Row 6: Primary LLM Utility -->
+                <tr class="hover:bg-slate-800/40 transition">
+                  <td class="p-4 font-semibold text-white bg-slate-900/30">
+                    Role in Agentic Stack
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <strong class="text-white"
+                      >Orchestrator & Ingress Gateway:</strong
+                    >
+                    Dispatches tasks, handles human-in-the-loop durable
+                    workflows, routes payloads.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <strong class="text-white"
+                      >Hands & Execution Muscle:</strong
+                    >
+                    Directly connects model context to local IDEs, terminals,
+                    Git, bash scripts, and private databases.
+                  </td>
+                  <td class="p-4 border-l border-darkborder">
+                    <strong class="text-white"
+                      >Long-term Semantic Brain:</strong
+                    >
+                    Connects disparate facts, resolves multi-hop relational
+                    dependencies, prevents hallucinations.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Deep Dive Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <!-- Cloudflare Workflows Details -->
+          <div
+            class="p-5 bg-darkcard rounded-xl border border-cf/30 flex flex-col justify-between"
+          >
+            <div>
+              <div
+                class="flex items-center gap-2 text-cf font-bold text-sm mb-3"
+              >
+                <i data-lucide="cloud" class="w-4 h-4"></i>
+                Cloudflare Agent Workflows
+              </div>
+              <p class="text-xs text-slate-300 leading-relaxed mb-4">
+                Built on top of Cloudflare Workers and Durable Objects.
+                Workflows provide guaranteed exactly-once or at-least-once
+                execution with automatic step-level checkpointing, backoff
+                retries, and sleep primitives that can wait for external events
+                without keeping compute hot.
+              </p>
+              <div class="space-y-2 text-xs">
+                <div class="text-[11px] font-semibold text-slate-400">
+                  Strengths:
+                </div>
+                <ul class="list-disc list-inside text-slate-300 space-y-1">
+                  <li>Zero-idle-cost state suspension</li>
+                  <li>Global geo-distributed edge ingress</li>
+                  <li>Built-in Workers AI and Vectorize integration</li>
+                </ul>
+              </div>
+            </div>
+            <div
+              class="mt-4 pt-3 border-t border-darkborder text-[11px] font-mono text-cf"
+            >
+              Best for: Webhooks, Task Pipelines, Edge Orchestration
+            </div>
+          </div>
+
+          <!-- Local MCP Details -->
+          <div
+            class="p-5 bg-darkcard rounded-xl border border-mcp/30 flex flex-col justify-between"
+          >
+            <div>
+              <div
+                class="flex items-center gap-2 text-mcp font-bold text-sm mb-3"
+              >
+                <i data-lucide="cpu" class="w-4 h-4"></i>
+                Local Model Context Protocol
+              </div>
+              <p class="text-xs text-slate-300 leading-relaxed mb-4">
+                Anthropic's open protocol standardizing how AI models interact
+                with data sources and tools. Local MCP servers run alongside
+                development environments or secure enterprise bastions, exposing
+                structured endpoints via stdio or SSE without exposing sensitive
+                internal tokens to public endpoints.
+              </p>
+              <div class="space-y-2 text-xs">
+                <div class="text-[11px] font-semibold text-slate-400">
+                  Strengths:
+                </div>
+                <ul class="list-disc list-inside text-slate-300 space-y-1">
+                  <li>Native local filesystem & CLI access</li>
+                  <li>Uniform JSON-RPC specification</li>
+                  <li>Eliminates bespoke API client wrappers</li>
+                </ul>
+              </div>
+            </div>
+            <div
+              class="mt-4 pt-3 border-t border-darkborder text-[11px] font-mono text-mcp"
+            >
+              Best for: Local Developer Tools, Bastion Hosts, Intranet Execution
+            </div>
+          </div>
+
+          <!-- Neo4j Graph Details -->
+          <div
+            class="p-5 bg-darkcard rounded-xl border border-neo/30 flex flex-col justify-between"
+          >
+            <div>
+              <div
+                class="flex items-center gap-2 text-neo font-bold text-sm mb-3"
+              >
+                <i data-lucide="share-2" class="w-4 h-4"></i>
+                Neo4j Knowledge Graph
+              </div>
+              <p class="text-xs text-slate-300 leading-relaxed mb-4">
+                Graph database designed for highly connected data. In an agent
+                workflow, Neo4j serves as the ontological memory store:
+                entities, concepts, conversation turns, and external enterprise
+                databases are indexed as nodes connected by typed, weighted
+                edges for multi-hop graph traversal.
+              </p>
+              <div class="space-y-2 text-xs">
+                <div class="text-[11px] font-semibold text-slate-400">
+                  Strengths:
+                </div>
+                <ul class="list-disc list-inside text-slate-300 space-y-1">
+                  <li>Deterministic multi-hop path query (Cypher)</li>
+                  <li>Hybrid Vector + Knowledge Graph search (GraphRAG)</li>
+                  <li>Explaining agent decisions via traceable graph paths</li>
+                </ul>
+              </div>
+            </div>
+            <div
+              class="mt-4 pt-3 border-t border-darkborder text-[11px] font-mono text-neo"
+            >
+              Best for: GraphRAG, Ontological Memory, Enterprise Context
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 3: HYBRID ARCHITECTURE PATTERNS (Hidden by default) -->
+      <div
+        id="view-topology"
+        class="hidden flex-1 p-6 md:p-8 overflow-y-auto max-w-6xl mx-auto w-full"
+      >
+        <div class="mb-6">
+          <h2 class="text-xl font-bold text-white flex items-center gap-2">
+            <i data-lucide="layers" class="w-5 h-5 text-emerald-400"></i>
+            Recommended Hybrid Production Topologies
+          </h2>
+          <p class="text-sm text-slate-400 mt-1">
+            Real-world reference designs synthesizing Cloudflare, MCP, and Neo4j
+          </p>
+        </div>
+
+        <div class="space-y-6">
+          <!-- Pattern 1: Secure Edge Ingress with Local Bastion Execution -->
+          <div
+            class="p-5 bg-darkcard rounded-xl border border-darkborder hover:border-emerald-500/50 transition"
+          >
+            <div class="flex items-center justify-between mb-3">
+              <h3
+                class="text-base font-bold text-white flex items-center gap-2"
+              >
+                <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+                Pattern 1: Edge Orchestration with Tunnel-Bridged Local MCP
+              </h3>
+              <span
+                class="text-xs px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono"
+                >Recommended for Enterprise DevSecOps</span
+              >
+            </div>
+            <p class="text-xs text-slate-300 leading-relaxed mb-4">
+              Cloudflare Workflows handles external user requests, authenticates
+              identity via Cloudflare Access, and constructs initial reasoning
+              steps. When local actions are required (e.g. running code in a
+              secure sandbox, interacting with on-prem databases), the
+              Cloudflare Workflow publishes an RPC event down an established
+              <code>Cloudflare Tunnel</code> (SSE/WebSocket) to an internal host
+              running an <code>MCP Server</code>. The result is returned
+              securely without exposing any ports on the local network.
+            </p>
+            <div
+              class="bg-slate-900 p-3 rounded-lg border border-darkborder font-mono text-xs text-slate-300 overflow-x-auto"
+            >
+              [Client] ➔ (HTTPS) ➔ [Cloudflare Edge Worker / Workflow] │
+              (Cloudflare Tunnel / SSE) ▼ [Secure Intranet MCP Bastion] ➔ [Local
+              DB / File System / Docker]
+            </div>
+          </div>
+
+          <!-- Pattern 2: Graph-Grounded Agentic GraphRAG -->
+          <div
+            class="p-5 bg-darkcard rounded-xl border border-darkborder hover:border-emerald-500/50 transition"
+          >
+            <div class="flex items-center justify-between mb-3">
+              <h3
+                class="text-base font-bold text-white flex items-center gap-2"
+              >
+                <span class="w-2 h-2 rounded-full bg-neo"></span>
+                Pattern 2: Neo4j Knowledge Graph as the MCP Shared Brain
+              </h3>
+              <span
+                class="text-xs px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono"
+                >Recommended for Complex Reasoning</span
+              >
+            </div>
+            <p class="text-xs text-slate-300 leading-relaxed mb-4">
+              A local or remote MCP Server exposes specialized Neo4j graph tools
+              directly to LLMs (such as Claude 3.7 or GPT-4o). The agent calls
+              <code>query_graph_cypher</code>,
+              <code>extract_entity_neighborhood</code>, or
+              <code>vector_subgraph_hybrid_search</code> via MCP tool-calling.
+              This replaces raw vector search with deterministic structural
+              knowledge graphs, ensuring agents don't produce hallucinated
+              relationships.
+            </p>
+            <div
+              class="bg-slate-900 p-3 rounded-lg border border-darkborder font-mono text-xs text-slate-300 overflow-x-auto"
+            >
+              [LLM Host / Agent] ➔ (MCP JSON-RPC) ➔ [Neo4j MCP Tool Server] ➔
+              (Bolt/TLS) ➔ [Neo4j AuraDB] │ (Graph Traversal) ▼ [Nodes:
+              Concepts, Code, Policies, Users]
+            </div>
+          </div>
+
+          <!-- Pattern 3: Tri-Tier Autonomous Swarm -->
+          <div
+            class="p-5 bg-darkcard rounded-xl border border-darkborder hover:border-emerald-500/50 transition"
+          >
+            <div class="flex items-center justify-between mb-3">
+              <h3
+                class="text-base font-bold text-white flex items-center gap-2"
+              >
+                <span class="w-2 h-2 rounded-full bg-cf"></span>
+                Pattern 3: Full Tri-Tier Autonomous Swarm
+              </h3>
+              <span
+                class="text-xs px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono"
+                >Full Spectrum Deployment</span
+              >
+            </div>
+            <p class="text-xs text-slate-300 leading-relaxed mb-4">
+              Cloudflare Workflows maintains persistent multi-day workflow state
+              and manages timeouts/callbacks; Neo4j serves as the shared
+              semantic memory layer queried by edge workers; and Local MCP
+              servers act as autonomous execution nodes dispatched to perform
+              operations requiring host-level tooling and local compute.
+            </p>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <button
+                onclick="
+                  applyPresetTopology('hybrid');
+                  switchTab('diagram');
+                "
+                class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-medium transition flex items-center gap-1.5"
+              >
+                <i data-lucide="eye" class="w-3.5 h-3.5"></i>
+                <span>Load This Architecture in Interactive Diagram</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Interactive JavaScript Application Engine -->
+    <script>
+      // System Data Model
+      const systemModel = {
+        nodes: [
+          // Cloudflare Edge Layer
+          {
+            id: "cf-ingress",
+            name: "Cloudflare Ingress & WAF",
+            category: "cloudflare",
+            tier: "Edge Ingress",
+            x: 80,
+            y: 120,
+            status: "online",
+            icon: "shield-check",
+            color: "cf",
+            desc: "DDoS protection, Global Anycast DNS, SSL termination, and rate limiting.",
+          },
+          {
+            id: "cf-workflow",
+            name: "Cloudflare Workflow Coordinator",
+            category: "cloudflare",
+            tier: "Orchestrator",
+            x: 320,
+            y: 120,
+            status: "active",
+            icon: "git-merge",
+            color: "cf",
+            desc: "Durable state machine handling step retries, backoff, human-in-the-loop approvals, and timeouts.",
+          },
+          {
+            id: "cf-durable",
+            name: "Durable Object (Agent State)",
+            category: "cloudflare",
+            tier: "Edge State",
+            x: 320,
+            y: 280,
+            status: "active",
+            icon: "database",
+            color: "cf",
+            desc: "Strongly consistent actor model memory for coordinating concurrent user sessions.",
+          },
+
+          // Local MCP Layer
+          {
+            id: "cf-tunnel",
+            name: "Cloudflare Tunnel (cloudflared)",
+            category: "mcp",
+            tier: "Security Bridge",
+            x: 580,
+            y: 120,
+            status: "online",
+            icon: "radio",
+            color: "mcp",
+            desc: "Encrypted outbound-only tunnel bridging public Edge Workers to private intranet hosts.",
+          },
+          {
+            id: "mcp-server",
+            name: "Local MCP Server (Stdio/SSE)",
+            category: "mcp",
+            tier: "Execution Engine",
+            x: 840,
+            y: 120,
+            status: "ready",
+            icon: "terminal",
+            color: "mcp",
+            desc: "Standardized Model Context Protocol server exposing filesystem, CLI, git, and local device APIs.",
+          },
+          {
+            id: "mcp-tools",
+            name: "Host System / Tool Sandbox",
+            category: "mcp",
+            tier: "Runtime",
+            x: 840,
+            y: 280,
+            status: "ready",
+            icon: "hard-drive",
+            color: "mcp",
+            desc: "Protected container or OS environment running Python scripts, Docker builds, and tests.",
+          },
+
+          // Neo4j Knowledge Graph Layer
+          {
+            id: "neo-adapter",
+            name: "Neo4j MCP Graph Tool Adapter",
+            category: "neo4j",
+            tier: "Integration",
+            x: 580,
+            y: 380,
+            status: "ready",
+            icon: "blocks",
+            color: "neo",
+            desc: "Translates natural language questions to parameterized Cypher queries and subgraphs.",
+          },
+          {
+            id: "neo-graph",
+            name: "Neo4j Knowledge Graph Core",
+            category: "neo4j",
+            tier: "Persistent Graph",
+            x: 320,
+            y: 450,
+            status: "online",
+            icon: "share-2",
+            color: "neo",
+            desc: "Labeled Property Graph (LPG) with ACID indexing, vector embeddings, and entity relationships.",
+          },
+        ],
+        connections: [
+          {
+            from: "cf-ingress",
+            to: "cf-workflow",
+            label: "HTTP / Event Trigger",
+            color: "cf",
+          },
+          {
+            from: "cf-workflow",
+            to: "cf-durable",
+            label: "Actor State Bindings",
+            color: "cf",
+          },
+          {
+            from: "cf-workflow",
+            to: "cf-tunnel",
+            label: "RPC / Webhook Payload",
+            color: "mcp",
+          },
+          {
+            from: "cf-tunnel",
+            to: "mcp-server",
+            label: "SSE / JSON-RPC 2.0",
+            color: "mcp",
+          },
+          {
+            from: "mcp-server",
+            to: "mcp-tools",
+            label: "OS Process / Stdio",
+            color: "mcp",
+          },
+          {
+            from: "mcp-server",
+            to: "neo-adapter",
+            label: "Graph Query Tool Call",
+            color: "neo",
+          },
+          {
+            from: "neo-adapter",
+            to: "neo-graph",
+            label: "Bolt Protocol (Cypher)",
+            color: "neo",
+          },
+          {
+            from: "cf-workflow",
+            to: "neo-graph",
+            label: "Async Context Enrichment",
+            color: "neo",
+          },
+        ],
+      };
+
+      // Global state
+      let selectedNodeId = null;
+      let connectingSourceId = null;
+      let simulationActive = true;
+      let simInterval = null;
+      let particles = [];
+      let isDragging = false;
+      let dragNode = null;
+      let dragOffset = { x: 0, y: 0 };
+
+      // Initialize application
+      window.addEventListener("DOMContentLoaded", () => {
+        refreshIcons();
+        renderDiagram();
+        startParticleSimulation();
+
+        // Setup window resize listener
+        window.addEventListener("resize", () => {
+          updateConnectionLines();
+        });
+
+        // Canvas global mouse events for node dragging
+        const viewport = document.getElementById("canvasViewport");
+        viewport.addEventListener("mousemove", handleMouseMove);
+        viewport.addEventListener("mouseup", handleMouseUp);
+        viewport.addEventListener("mouseleave", handleMouseUp);
+
+        // Select first node by default for inspector
+        selectNode("cf-workflow");
+      });
+
+      // View Switching
+      function switchTab(tab) {
+        const tabs = ["diagram", "spec", "topology"];
+        tabs.forEach((t) => {
+          const viewEl = document.getElementById(`view-${t}`);
+          const btnEl = document.getElementById(`tab${capitalize(t)}Btn`);
+          if (t === tab) {
+            viewEl.classList.remove("hidden");
+            if (btnEl) {
+              btnEl.className =
+                "flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-emerald-600 text-white transition shadow-sm";
+            }
+          } else {
+            viewEl.classList.add("hidden");
+            if (btnEl) {
+              btnEl.className =
+                "flex items-center space-x-1.5 px-3 py-1.5 rounded-md text-xs font-semibold text-slate-400 hover:text-white transition";
+            }
+          }
+        });
+        refreshIcons();
+        if (tab === "diagram") {
+          setTimeout(updateConnectionLines, 50);
+        }
+      }
+
+      function capitalize(str) {
+        return str.charAt(0).toUpperCase() + str.slice(1);
+      }
+
+      function refreshIcons() {
+        window.lucide?.createIcons?.();
+      }
+
+      // Dynamic model values are rendered into a few HTML templates below.
+      // Keep the prototype safe when nodes eventually come from an API/import.
+      function escapeHtml(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (character) => {
+          const entities = {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#039;",
+          };
+          return entities[character];
+        });
+      }
+
+      // Render entire diagram nodes and SVG connections
+      function renderDiagram() {
+        const container = document.getElementById("nodesContainer");
+        container.innerHTML = "";
+
+        systemModel.nodes.forEach((node) => {
+          const nodeEl = document.createElement("div");
+          nodeEl.id = `node-${node.id}`;
+
+          let glowClass = "node-glow-cf border-cf/40";
+          let badgeColor = "text-cf bg-orange-950/40 border-orange-800/40";
+          let dotColor = "bg-cf";
+
+          if (node.category === "mcp") {
+            glowClass = "node-glow-mcp border-mcp/40";
+            badgeColor = "text-mcp bg-purple-950/40 border-purple-800/40";
+            dotColor = "bg-mcp";
+          } else if (node.category === "neo4j") {
+            glowClass = "node-glow-neo border-neo/40";
+            badgeColor = "text-neo bg-sky-950/40 border-sky-800/40";
+            dotColor = "bg-neo";
+          }
+
+          const isSelected = selectedNodeId === node.id;
+          const selectedBorder = isSelected
+            ? "ring-2 ring-emerald-400 border-emerald-400"
+            : "";
+
+          nodeEl.className = `absolute pointer-events-auto cursor-move select-none rounded-xl bg-slate-900/95 border backdrop-blur-md p-3 w-56 shadow-xl transition-shadow ${glowClass} ${selectedBorder}`;
+          nodeEl.style.left = `${node.x}px`;
+          nodeEl.style.top = `${node.y}px`;
+
+          nodeEl.innerHTML = `
+          <div class="flex items-start justify-between gap-2 mb-1.5">
+            <span class="text-[10px] font-mono px-2 py-0.5 rounded border uppercase tracking-wider font-semibold ${badgeColor}">
+              ${escapeHtml(node.tier)}
+            </span>
+            <span class="flex h-2 w-2 relative">
+              <span class="animate-ping absolute inline-flex h-full w-full rounded-full ${dotColor} opacity-75"></span>
+              <span class="relative inline-flex rounded-full h-2 w-2 ${dotColor}"></span>
+            </span>
+          </div>
+          <div class="font-bold text-xs text-white truncate flex items-center gap-1.5">
+            <i data-lucide="${escapeHtml(node.icon || "box")}" class="w-3.5 h-3.5 shrink-0 text-slate-300"></i>
+            <span class="truncate">${escapeHtml(node.name)}</span>
+          </div>
+          <div class="text-[11px] text-slate-400 mt-1 line-clamp-2 leading-tight">
+            ${escapeHtml(node.desc)}
+          </div>
+        `;
+
+          // Click selection and mousedown dragging
+          nodeEl.addEventListener("mousedown", (e) =>
+            handleNodeMouseDown(e, node),
+          );
+          nodeEl.addEventListener("click", (e) => {
+            e.stopPropagation();
+            handleNodeClick(node);
+          });
+
+          container.appendChild(nodeEl);
+        });
+
+        updateConnectionLines();
+        refreshIcons();
+      }
+
+      // SVG Connection lines rendering
+      function updateConnectionLines() {
+        const connectionsLayer = document.getElementById("connectionsLayer");
+        const canvas = document.getElementById("canvasViewport");
+        if (!connectionsLayer || !canvas) return;
+        connectionsLayer.innerHTML = "";
+
+        const canvasRect = canvas.getBoundingClientRect();
+
+        systemModel.connections.forEach((conn, index) => {
+          const fromNode = systemModel.nodes.find((n) => n.id === conn.from);
+          const toNode = systemModel.nodes.find((n) => n.id === conn.to);
+          const fromEl = document.getElementById(`node-${conn.from}`);
+          const toEl = document.getElementById(`node-${conn.to}`);
+          if (!fromNode || !toNode || !fromEl || !toEl) return;
+
+          // Use the rendered card dimensions so wrapping/responsive layouts
+          // cannot make the SVG connections drift away from their nodes.
+          const fromRect = fromEl.getBoundingClientRect();
+          const toRect = toEl.getBoundingClientRect();
+          const x1 = fromRect.left - canvasRect.left + fromRect.width / 2;
+          const y1 = fromRect.top - canvasRect.top + fromRect.height / 2;
+          const x2 = toRect.left - canvasRect.left + toRect.width / 2;
+          const y2 = toRect.top - canvasRect.top + toRect.height / 2;
+
+          let strokeColor = "#f38020";
+          let markerId = "arrow-cf";
+
+          if (conn.color === "mcp") {
+            strokeColor = "#8b5cf6";
+            markerId = "arrow-mcp";
+          } else if (conn.color === "neo") {
+            strokeColor = "#008cc1";
+            markerId = "arrow-neo";
+          }
+
+          // Generate curved cubic bezier path
+          const dx = (x2 - x1) * 0.45;
+          const dy = (y2 - y1) * 0.15;
+          const pathData = `M ${x1} ${y1} C ${x1 + dx} ${y1 + dy}, ${x2 - dx} ${y2 - dy}, ${x2} ${y2}`;
+
+          const pathEl = document.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "path",
+          );
+          pathEl.setAttribute("d", pathData);
+          pathEl.setAttribute("stroke", strokeColor);
+          pathEl.setAttribute("stroke-width", "2");
+          pathEl.setAttribute("stroke-dasharray", "4 4");
+          pathEl.setAttribute("fill", "none");
+          pathEl.setAttribute("marker-end", `url(#${markerId})`);
+          pathEl.setAttribute("opacity", "0.7");
+          pathEl.id = `conn-path-${index}`;
+
+          // Path Click to inspect or remove connection
+          pathEl.addEventListener("click", (e) => {
+            e.stopPropagation();
+            inspectConnection(conn, index);
+          });
+
+          connectionsLayer.appendChild(pathEl);
+
+          // Optional connection text label at midpoint
+          const midX = (x1 + x2) / 2;
+          const midY = (y1 + y2) / 2;
+          const textEl = document.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "text",
+          );
+          textEl.setAttribute("x", midX);
+          textEl.setAttribute("y", midY - 6);
+          textEl.setAttribute("fill", "#94a3b8");
+          textEl.setAttribute("font-size", "10");
+          textEl.setAttribute("text-anchor", "middle");
+          textEl.setAttribute("class", "pointer-events-none font-mono");
+          textEl.textContent = conn.label || "";
+          connectionsLayer.appendChild(textEl);
+        });
+      }
+
+      // Node drag handlers
+      function handleNodeMouseDown(e, node) {
+        if (e.button !== 0) return; // Only left click
+        isDragging = true;
+        dragNode = node;
+        const canvasRect = document
+          .getElementById("canvasViewport")
+          .getBoundingClientRect();
+        dragOffset.x = e.clientX - canvasRect.left - node.x;
+        dragOffset.y = e.clientY - canvasRect.top - node.y;
+      }
+
+      function handleMouseMove(e) {
+        if (!isDragging || !dragNode) return;
+        const canvasRect = document
+          .getElementById("canvasViewport")
+          .getBoundingClientRect();
+        let newX = e.clientX - canvasRect.left - dragOffset.x;
+        let newY = e.clientY - canvasRect.top - dragOffset.y;
+
+        // Keep within bounds
+        const maxX = Math.max(10, canvasRect.width - 240);
+        const maxY = Math.max(10, canvasRect.height - 120);
+        newX = Math.max(10, Math.min(maxX, newX));
+        newY = Math.max(10, Math.min(maxY, newY));
+
+        dragNode.x = newX;
+        dragNode.y = newY;
+
+        const nodeEl = document.getElementById(`node-${dragNode.id}`);
+        if (nodeEl) {
+          nodeEl.style.left = `${newX}px`;
+          nodeEl.style.top = `${newY}px`;
+        }
+
+        updateConnectionLines();
+      }
+
+      function handleMouseUp() {
+        isDragging = false;
+        dragNode = null;
+      }
+
+      // Node selection & connection mode handling
+      function handleNodeClick(node) {
+        if (connectingSourceId) {
+          if (connectingSourceId === node.id) {
+            showToast("Connection cancelled: Self-loop not permitted.");
+          } else {
+            // Add connection
+            const exists = systemModel.connections.some(
+              (c) => c.from === connectingSourceId && c.to === node.id,
+            );
+            if (exists) {
+              showToast("Connection already exists between these components.");
+            } else {
+              const src = systemModel.nodes.find(
+                (n) => n.id === connectingSourceId,
+              );
+              systemModel.connections.push({
+                from: connectingSourceId,
+                to: node.id,
+                label: "Direct Channel",
+                color: src ? src.color : "cf",
+              });
+              showToast(`Connected ${connectingSourceId} ➔ ${node.id}`);
+              updateConnectionLines();
+            }
+          }
+          connectingSourceId = null;
+          document.getElementById("modeStatusIndicator").innerHTML = `
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          Mode: Interactive Drag & Select
+        `;
+          return;
+        }
+
+        selectNode(node.id);
+      }
+
+      function selectNode(nodeId) {
+        selectedNodeId = nodeId;
+        const node = systemModel.nodes.find((n) => n.id === nodeId);
+        if (!node) return;
+
+        // Update node DOM styling
+        systemModel.nodes.forEach((n) => {
+          const el = document.getElementById(`node-${n.id}`);
+          if (el) {
+            if (n.id === nodeId) {
+              el.classList.add(
+                "ring-2",
+                "ring-emerald-400",
+                "border-emerald-400",
+              );
+            } else {
+              el.classList.remove(
+                "ring-2",
+                "ring-emerald-400",
+                "border-emerald-400",
+              );
+            }
+          }
+        });
+
+        // Update Inspector Panel Content
+        const titleEl = document.getElementById("inspectorTitle");
+        const catEl = document.getElementById("inspectorCategory");
+        const tierEl = document.getElementById("inspectorTier");
+        const iconEl = document.getElementById("inspectorIcon");
+        const bodyEl = document.getElementById("inspectorBody");
+
+        titleEl.innerText = node.name;
+        catEl.innerText = `Protocol ID: ${node.id} • ${node.category.toUpperCase()}`;
+        tierEl.innerText = node.tier;
+
+        let colorClass = "text-cf";
+        if (node.category === "mcp") colorClass = "text-mcp";
+        if (node.category === "neo4j") colorClass = "text-neo";
+
+        iconEl.className = `p-2 rounded bg-slate-800 ${colorClass}`;
+        iconEl.innerHTML = `<i data-lucide="${escapeHtml(node.icon || "box")}" class="w-4 h-4"></i>`;
+
+        // Detailed specs for selected item
+        bodyEl.innerHTML = `
+        <div class="p-3 bg-darkcard rounded-lg border border-darkborder space-y-1.5">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Functional Role</div>
+          <p class="text-slate-200">${escapeHtml(node.desc)}</p>
+        </div>
+
+        <div class="border border-darkborder rounded-lg p-3 bg-slate-900/60 space-y-2">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Operational Metrics</div>
+          <div class="grid grid-cols-2 gap-2 text-[11px]">
+            <div class="p-2 bg-slate-800/80 rounded border border-darkborder">
+              <span class="text-slate-400 block">Typical Latency</span>
+              <span class="font-mono font-bold text-emerald-400">${getLatencyFor(node.category)}</span>
+            </div>
+            <div class="p-2 bg-slate-800/80 rounded border border-darkborder">
+              <span class="text-slate-400 block">Isolation Level</span>
+              <span class="font-mono font-bold text-slate-200">${getIsolationFor(node.category)}</span>
+            </div>
+            <div class="p-2 bg-slate-800/80 rounded border border-darkborder">
+              <span class="text-slate-400 block">Transport Wire</span>
+              <span class="font-mono font-bold text-slate-200">${getTransportFor(node.category)}</span>
+            </div>
+            <div class="p-2 bg-slate-800/80 rounded border border-darkborder">
+              <span class="text-slate-400 block">Durability</span>
+              <span class="font-mono font-bold text-slate-200">${getDurabilityFor(node.category)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="border-t border-darkborder pt-3">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-2">Connected Outbound Links</div>
+          <div class="space-y-1" id="inspectorOutbounds">
+            ${getOutboundLinksHtml(node.id)}
+          </div>
+        </div>
+      `;
+
+        refreshIcons();
+      }
+
+      function getLatencyFor(cat) {
+        if (cat === "cloudflare") return "< 15 ms (Edge)";
+        if (cat === "mcp") return "< 2 ms (Stdio/Local)";
+        return "15 - 45 ms (Graph Query)";
+      }
+
+      function getIsolationFor(cat) {
+        if (cat === "cloudflare") return "V8 Web Worker";
+        if (cat === "mcp") return "Host OS / Sandbox";
+        return "DBMS Auth / RBAC";
+      }
+
+      function getTransportFor(cat) {
+        if (cat === "cloudflare") return "HTTPS / HTTP3 / WS";
+        if (cat === "mcp") return "JSON-RPC 2.0 (stdio)";
+        return "Bolt Protocol / TCP";
+      }
+
+      function getDurabilityFor(cat) {
+        if (cat === "cloudflare") return "Stepwise Resumable";
+        if (cat === "mcp") return "Stateless Tool Call";
+        return "ACID Graph Store";
+      }
+
+      function getOutboundLinksHtml(nodeId) {
+        const outbounds = systemModel.connections.filter(
+          (c) => c.from === nodeId,
+        );
+        if (outbounds.length === 0) {
+          return '<div class="text-slate-500 italic text-[11px]">No outbound links from this component.</div>';
+        }
+        return outbounds
+          .map(
+            (c) => `
+        <div class="flex items-center justify-between p-1.5 bg-slate-800 rounded border border-darkborder text-[11px]">
+          <span class="text-slate-300 font-mono">➔ ${escapeHtml(c.to)}</span>
+          <span class="text-slate-500">${escapeHtml(c.label)}</span>
+        </div>
+      `,
+          )
+          .join("");
+      }
+
+      function startNodeConnection() {
+        if (!selectedNodeId) {
+          showToast("Please select a starting component first.");
+          return;
+        }
+        connectingSourceId = selectedNodeId;
+        document.getElementById("modeStatusIndicator").innerHTML = `
+        <span class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+        <span class="text-amber-300 font-semibold">Select Destination Node...</span>
+      `;
+        showToast(
+          "Click another node on the canvas to establish outbound connection.",
+        );
+      }
+
+      function deleteSelectedNode() {
+        if (!selectedNodeId) return;
+        const id = selectedNodeId;
+        if (connectingSourceId === id) connectingSourceId = null;
+        // Remove node
+        systemModel.nodes = systemModel.nodes.filter((n) => n.id !== id);
+        // Remove connections
+        systemModel.connections = systemModel.connections.filter(
+          (c) => c.from !== id && c.to !== id,
+        );
+        selectedNodeId = null;
+        renderDiagram();
+        showToast(`Removed component: ${id}`);
+
+        // Reset inspector
+        document.getElementById("inspectorTitle").innerText =
+          "System Inspector";
+        document.getElementById("inspectorCategory").innerText =
+          "Select a component";
+        document.getElementById("inspectorTier").innerText = "Spec";
+        document.getElementById("inspectorBody").innerHTML = `
+        <p class="text-slate-400 text-xs">Component removed. Click on any block to inspect its telemetry and specs.</p>
+        `;
+      }
+
+      // Re-render a topology and keep the inspector pointed at a real node.
+      // Preset changes replace the model wholesale, so the previous selection
+      // may no longer exist.
+      function refreshTopologyUI(preferredNodeId = null) {
+        renderDiagram();
+        const nextNodeId =
+          preferredNodeId &&
+          systemModel.nodes.some((node) => node.id === preferredNodeId)
+            ? preferredNodeId
+            : systemModel.nodes.some((node) => node.id === selectedNodeId)
+              ? selectedNodeId
+              : systemModel.nodes[0]?.id || null;
+
+        selectedNodeId = nextNodeId;
+        if (nextNodeId) {
+          selectNode(nextNodeId);
+        } else {
+          document.getElementById("inspectorTitle").innerText = "System Inspector";
+          document.getElementById("inspectorCategory").innerText =
+            "Select a component";
+          document.getElementById("inspectorTier").innerText = "Spec";
+          document.getElementById("inspectorBody").innerHTML =
+            '<p class="text-slate-400 text-xs">No components in this topology.</p>';
+        }
+      }
+
+      function inspectConnection(conn, index) {
+        showToast(`Link: ${conn.from} ➔ ${conn.to} (${conn.label})`);
+      }
+
+      // Add component presets
+      function addNodePreset(type) {
+        const canvasRect = document
+          .getElementById("canvasViewport")
+          .getBoundingClientRect();
+        const randX = Math.floor(Math.random() * (canvasRect.width - 320)) + 60;
+        const randY =
+          Math.floor(Math.random() * (canvasRect.height - 220)) + 40;
+        const timestamp = Date.now().toString().slice(-4);
+
+        let newNode = null;
+
+        if (type === "cf-agent") {
+          newNode = {
+            id: `cf-agent-${timestamp}`,
+            name: `Durable Agent [${timestamp}]`,
+            category: "cloudflare",
+            tier: "Edge Actor",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "bot",
+            color: "cf",
+            desc: "Autonomous edge agent maintaining isolated conversational session memory and context.",
+          };
+        } else if (type === "cf-workflow") {
+          newNode = {
+            id: `cf-flow-${timestamp}`,
+            name: `Workflow Pipeline [${timestamp}]`,
+            category: "cloudflare",
+            tier: "Coordinator",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "workflow",
+            color: "cf",
+            desc: "Resilient multi-step DAG orchestrator supporting conditional retries and sleep hooks.",
+          };
+        } else if (type === "cf-vectorize") {
+          newNode = {
+            id: `cf-vec-${timestamp}`,
+            name: `Vectorize Index [${timestamp}]`,
+            category: "cloudflare",
+            tier: "Edge Vector",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "binary",
+            color: "cf",
+            desc: "Low-latency edge vector search index querying dense embeddings at millisecond speed.",
+          };
+        } else if (type === "mcp-host") {
+          newNode = {
+            id: `mcp-host-${timestamp}`,
+            name: `MCP Client Host [${timestamp}]`,
+            category: "mcp",
+            tier: "Agent Client",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "app-window",
+            color: "mcp",
+            desc: "Desktop or headless runtime (e.g., Claude Code, Cursor) issuing tool-call requests.",
+          };
+        } else if (type === "mcp-server") {
+          newNode = {
+            id: `mcp-srv-${timestamp}`,
+            name: `Custom MCP Tool Server [${timestamp}]`,
+            category: "mcp",
+            tier: "Tool Server",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "server",
+            color: "mcp",
+            desc: "Local microservice exposing custom business tools, file access, and bash commands.",
+          };
+        } else if (type === "mcp-tunnel") {
+          newNode = {
+            id: `mcp-tun-${timestamp}`,
+            name: `Zero Trust Ingress Bridge [${timestamp}]`,
+            category: "mcp",
+            tier: "Secure Tunnel",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "shield",
+            color: "mcp",
+            desc: "Exposes private intranet resources to Cloudflare edge workers without port forwarding.",
+          };
+        } else if (type === "neo-graph") {
+          newNode = {
+            id: `neo-db-${timestamp}`,
+            name: `Neo4j Graph Database [${timestamp}]`,
+            category: "neo4j",
+            tier: "Graph Core",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "share-2",
+            color: "neo",
+            desc: "High-performance property graph storing entities, relationships, and metadata indices.",
+          };
+        } else if (type === "neo-rag") {
+          newNode = {
+            id: `neo-rag-${timestamp}`,
+            name: `GraphRAG Retriever [${timestamp}]`,
+            category: "neo4j",
+            tier: "RAG Traversal",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "search",
+            color: "neo",
+            desc: "Multi-hop graph traversal engine combining Cypher entity lookups with semantic vector scores.",
+          };
+        } else if (type === "neo-ontology") {
+          newNode = {
+            id: `neo-ont-${timestamp}`,
+            name: `Ontology Schema Guard [${timestamp}]`,
+            category: "neo4j",
+            tier: "Schema Layer",
+            x: randX,
+            y: randY,
+            status: "ready",
+            icon: "file-text",
+            color: "neo",
+            desc: "Validates and enforces strict node label taxonomies and relationship cardinality.",
+          };
+        }
+
+        if (newNode) {
+          systemModel.nodes.push(newNode);
+          renderDiagram();
+          selectNode(newNode.id);
+          showToast(`Added component: ${newNode.name}`);
+        }
+      }
+
+      // Packet / Data Flow Animation Simulation
+      function startParticleSimulation() {
+        if (simInterval) clearInterval(simInterval);
+        const particlesLayer = document.getElementById("particlesLayer");
+
+        simInterval = setInterval(() => {
+          if (!simulationActive || systemModel.connections.length === 0) return;
+
+          // Choose random connection
+          const randomConnIndex = Math.floor(
+            Math.random() * systemModel.connections.length,
+          );
+          const pathEl = document.getElementById(
+            `conn-path-${randomConnIndex}`,
+          );
+          if (!pathEl) return;
+
+          const totalLength = pathEl.getTotalLength();
+          if (!totalLength) return;
+
+          const circle = document.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "circle",
+          );
+          circle.setAttribute("r", "4");
+          circle.setAttribute("fill", "url(#packetGrad)");
+          circle.setAttribute("filter", "drop-shadow(0 0 4px #10b981)");
+          particlesLayer.appendChild(circle);
+
+          let progress = 0;
+          const duration = 1200 + Math.random() * 600; // ms
+          const startTime = performance.now();
+
+          function animateParticle(currentTime) {
+            const elapsed = currentTime - startTime;
+            const factor = Math.min(elapsed / duration, 1);
+            const currentPoint = pathEl.getPointAtLength(factor * totalLength);
+
+            circle.setAttribute("cx", currentPoint.x);
+            circle.setAttribute("cy", currentPoint.y);
+
+            if (factor < 1) {
+              requestAnimationFrame(animateParticle);
+            } else {
+              if (circle.parentNode) {
+                circle.parentNode.removeChild(circle);
+              }
+            }
+          }
+          requestAnimationFrame(animateParticle);
+        }, 600);
+      }
+
+      function toggleSimulation() {
+        simulationActive = !simulationActive;
+        const badge = document.getElementById("simStatusBadge");
+        const btn = document.getElementById("toggleSimBtn");
+        if (simulationActive) {
+          badge.innerText = "Running";
+          badge.className = "text-emerald-400 font-mono";
+          btn.innerHTML = `<i data-lucide="pause" class="w-3.5 h-3.5"></i><span>Pause Packet Flow</span>`;
+          startParticleSimulation();
+          showToast("Traffic simulation resumed.");
+        } else {
+          badge.innerText = "Paused";
+          badge.className = "text-slate-500 font-mono";
+          btn.innerHTML = `<i data-lucide="play" class="w-3.5 h-3.5"></i><span>Resume Packet Flow</span>`;
+          showToast("Traffic simulation paused.");
+        }
+          refreshIcons();
+      }
+
+      // Preset Architectures
+      function applyPresetTopology(preset) {
+        if (preset === "hybrid") {
+          resetDefaultTopology();
+        } else if (preset === "cf_pure") {
+          systemModel.nodes = [
+            {
+              id: "cf-ingress",
+              name: "Cloudflare Ingress (Edge)",
+              category: "cloudflare",
+              tier: "Ingress",
+              x: 100,
+              y: 150,
+              status: "online",
+              icon: "shield-check",
+              color: "cf",
+              desc: "Anycast DNS and WAF firewall.",
+            },
+            {
+              id: "cf-flow",
+              name: "Orchestration Workflow",
+              category: "cloudflare",
+              tier: "Workflow Engine",
+              x: 400,
+              y: 150,
+              status: "active",
+              icon: "git-merge",
+              color: "cf",
+              desc: "Durable multi-step state execution.",
+            },
+            {
+              id: "cf-actor",
+              name: "Durable Object Actor",
+              category: "cloudflare",
+              tier: "State Memory",
+              x: 400,
+              y: 320,
+              status: "active",
+              icon: "database",
+              color: "cf",
+              desc: "Transactional edge coordinator.",
+            },
+            {
+              id: "cf-ai",
+              name: "Workers AI (Llama 3.3)",
+              category: "cloudflare",
+              tier: "Edge Inference",
+              x: 720,
+              y: 150,
+              status: "ready",
+              icon: "sparkles",
+              color: "cf",
+              desc: "Serverless model inferencing at edge.",
+            },
+            {
+              id: "cf-vec",
+              name: "Vectorize Edge Store",
+              category: "cloudflare",
+              tier: "Vector Database",
+              x: 720,
+              y: 320,
+              status: "ready",
+              icon: "binary",
+              color: "cf",
+              desc: "Vector similarity indexing.",
+            },
+          ];
+          systemModel.connections = [
+            {
+              from: "cf-ingress",
+              to: "cf-flow",
+              label: "HTTP Route",
+              color: "cf",
+            },
+            {
+              from: "cf-flow",
+              to: "cf-actor",
+              label: "State Sync",
+              color: "cf",
+            },
+            {
+              from: "cf-flow",
+              to: "cf-ai",
+              label: "Inference Call",
+              color: "cf",
+            },
+            {
+              from: "cf-flow",
+              to: "cf-vec",
+              label: "Nearest Neighbors",
+              color: "cf",
+            },
+          ];
+          refreshTopologyUI();
+          showToast("Loaded: Pure Cloudflare Edge Topology");
+        } else if (preset === "mcp_local") {
+          systemModel.nodes = [
+            {
+              id: "mcp-client",
+              name: "Claude Desktop / Cursor Host",
+              category: "mcp",
+              tier: "MCP Host",
+              x: 120,
+              y: 200,
+              status: "active",
+              icon: "app-window",
+              color: "mcp",
+              desc: "Front-end client holding model conversation.",
+            },
+            {
+              id: "mcp-std",
+              name: "Local MCP Server (Filesystem)",
+              category: "mcp",
+              tier: "Stdio Pipe",
+              x: 460,
+              y: 120,
+              status: "ready",
+              icon: "folder",
+              color: "mcp",
+              desc: "Exposes local read/write permissions.",
+            },
+            {
+              id: "mcp-cli",
+              name: "Local MCP Server (Terminal/Bash)",
+              category: "mcp",
+              tier: "Execution",
+              x: 460,
+              y: 300,
+              status: "ready",
+              icon: "terminal",
+              color: "mcp",
+              desc: "Safe command-line tool runner.",
+            },
+            {
+              id: "mcp-git",
+              name: "Git Repository & CI Agent",
+              category: "mcp",
+              tier: "Version Control",
+              x: 800,
+              y: 200,
+              status: "ready",
+              icon: "git-branch",
+              color: "mcp",
+              desc: "Branch management and commit generation.",
+            },
+          ];
+          systemModel.connections = [
+            {
+              from: "mcp-client",
+              to: "mcp-std",
+              label: "JSON-RPC (stdio)",
+              color: "mcp",
+            },
+            {
+              from: "mcp-client",
+              to: "mcp-cli",
+              label: "Tool Invocation",
+              color: "mcp",
+            },
+            {
+              from: "mcp-std",
+              to: "mcp-git",
+              label: "File Modification",
+              color: "mcp",
+            },
+            {
+              from: "mcp-cli",
+              to: "mcp-git",
+              label: "Git Push/Pull",
+              color: "mcp",
+            },
+          ];
+          refreshTopologyUI();
+          showToast("Loaded: Local MCP Desktop Topology");
+        } else if (preset === "neo_graphrag") {
+          systemModel.nodes = [
+            {
+              id: "user-query",
+              name: "Natural Language Agent Ingress",
+              category: "cloudflare",
+              tier: "Client Ingress",
+              x: 100,
+              y: 220,
+              status: "active",
+              icon: "message-square",
+              color: "cf",
+              desc: "Receives high-level user question.",
+            },
+            {
+              id: "neo-trans",
+              name: "Cypher Query Generator (LLM)",
+              category: "neo4j",
+              tier: "Query Planner",
+              x: 420,
+              y: 140,
+              status: "ready",
+              icon: "cpu",
+              color: "neo",
+              desc: "Extracts entities & forms multi-hop graph match.",
+            },
+            {
+              id: "neo-engine",
+              name: "Neo4j Graph Database (Aura)",
+              category: "neo4j",
+              tier: "Graph Core",
+              x: 740,
+              y: 220,
+              status: "online",
+              icon: "share-2",
+              color: "neo",
+              desc: "Traverses relations without join penalties.",
+            },
+            {
+              id: "neo-synthesizer",
+              name: "GraphRAG Synthesis Engine",
+              category: "neo4j",
+              tier: "Synthesizer",
+              x: 420,
+              y: 320,
+              status: "ready",
+              icon: "layers",
+              color: "neo",
+              desc: "Injects verified graph facts into context window.",
+            },
+          ];
+          systemModel.connections = [
+            {
+              from: "user-query",
+              to: "neo-trans",
+              label: "Question Payload",
+              color: "cf",
+            },
+            {
+              from: "neo-trans",
+              to: "neo-engine",
+              label: "Cypher (MATCH n-[]->m)",
+              color: "neo",
+            },
+            {
+              from: "neo-engine",
+              to: "neo-synthesizer",
+              label: "Graph Subgraphs",
+              color: "neo",
+            },
+            {
+              from: "neo-synthesizer",
+              to: "user-query",
+              label: "Verified Answer",
+              color: "neo",
+            },
+          ];
+          refreshTopologyUI();
+          showToast("Loaded: GraphRAG Traversal Topology");
+        }
+      }
+
+      function resetDefaultTopology() {
+        // Revert to default
+        systemModel.nodes = [
+          {
+            id: "cf-ingress",
+            name: "Cloudflare Ingress & WAF",
+            category: "cloudflare",
+            tier: "Edge Ingress",
+            x: 80,
+            y: 120,
+            status: "online",
+            icon: "shield-check",
+            color: "cf",
+            desc: "DDoS protection, Global Anycast DNS, SSL termination, and rate limiting.",
+          },
+          {
+            id: "cf-workflow",
+            name: "Cloudflare Workflow Coordinator",
+            category: "cloudflare",
+            tier: "Orchestrator",
+            x: 320,
+            y: 120,
+            status: "active",
+            icon: "git-merge",
+            color: "cf",
+            desc: "Durable state machine handling step retries, backoff, human-in-the-loop approvals, and timeouts.",
+          },
+          {
+            id: "cf-durable",
+            name: "Durable Object (Agent State)",
+            category: "cloudflare",
+            tier: "Edge State",
+            x: 320,
+            y: 280,
+            status: "active",
+            icon: "database",
+            color: "cf",
+            desc: "Strongly consistent actor model memory for coordinating concurrent user sessions.",
+          },
+          {
+            id: "cf-tunnel",
+            name: "Cloudflare Tunnel (cloudflared)",
+            category: "mcp",
+            tier: "Security Bridge",
+            x: 580,
+            y: 120,
+            status: "online",
+            icon: "radio",
+            color: "mcp",
+            desc: "Encrypted outbound-only tunnel bridging public Edge Workers to private intranet hosts.",
+          },
+          {
+            id: "mcp-server",
+            name: "Local MCP Server (Stdio/SSE)",
+            category: "mcp",
+            tier: "Execution Engine",
+            x: 840,
+            y: 120,
+            status: "ready",
+            icon: "terminal",
+            color: "mcp",
+            desc: "Standardized Model Context Protocol server exposing filesystem, CLI, git, and local device APIs.",
+          },
+          {
+            id: "mcp-tools",
+            name: "Host System / Tool Sandbox",
+            category: "mcp",
+            tier: "Runtime",
+            x: 840,
+            y: 280,
+            status: "ready",
+            icon: "hard-drive",
+            color: "mcp",
+            desc: "Protected container or OS environment running Python scripts, Docker builds, and tests.",
+          },
+          {
+            id: "neo-adapter",
+            name: "Neo4j MCP Graph Tool Adapter",
+            category: "neo4j",
+            tier: "Integration",
+            x: 580,
+            y: 380,
+            status: "ready",
+            icon: "blocks",
+            color: "neo",
+            desc: "Translates natural language questions to parameterized Cypher queries and subgraphs.",
+          },
+          {
+            id: "neo-graph",
+            name: "Neo4j Knowledge Graph Core",
+            category: "neo4j",
+            tier: "Persistent Graph",
+            x: 320,
+            y: 450,
+            status: "online",
+            icon: "share-2",
+            color: "neo",
+            desc: "Labeled Property Graph (LPG) with ACID indexing, vector embeddings, and entity relationships.",
+          },
+        ];
+        systemModel.connections = [
+          {
+            from: "cf-ingress",
+            to: "cf-workflow",
+            label: "HTTP / Event Trigger",
+            color: "cf",
+          },
+          {
+            from: "cf-workflow",
+            to: "cf-durable",
+            label: "Actor State Bindings",
+            color: "cf",
+          },
+          {
+            from: "cf-workflow",
+            to: "cf-tunnel",
+            label: "RPC / Webhook Payload",
+            color: "mcp",
+          },
+          {
+            from: "cf-tunnel",
+            to: "mcp-server",
+            label: "SSE / JSON-RPC 2.0",
+            color: "mcp",
+          },
+          {
+            from: "mcp-server",
+            to: "mcp-tools",
+            label: "OS Process / Stdio",
+            color: "mcp",
+          },
+          {
+            from: "mcp-server",
+            to: "neo-adapter",
+            label: "Graph Query Tool Call",
+            color: "neo",
+          },
+          {
+            from: "neo-adapter",
+            to: "neo-graph",
+            label: "Bolt Protocol (Cypher)",
+            color: "neo",
+          },
+          {
+            from: "cf-workflow",
+            to: "neo-graph",
+            label: "Async Context Enrichment",
+            color: "neo",
+          },
+        ];
+        refreshTopologyUI("cf-workflow");
+        showToast("Architecture reset to baseline hybrid configuration.");
+      }
+
+      // Export Architecture Specification JSON
+      function exportArchitectureJSON() {
+        const exportData = {
+          specVersion: "2.4.0",
+          timestamp: new Date().toISOString(),
+          comparisonMatrix: {
+            domains: [
+              "Cloudflare Edge Agents",
+              "Local MCP Servers",
+              "Neo4j Knowledge Graph",
+            ],
+            edgeLatency: "< 15ms",
+            localMcpIpc: "< 2ms",
+            graphTraversal: "10-45ms",
+          },
+          topology: systemModel,
+        };
+
+        const jsonStr = JSON.stringify(exportData, null, 2);
+
+        const fileName = `architectural-spec-${new Date()
+          .toISOString()
+          .slice(0, 10)}.json`;
+        const blob = new Blob([jsonStr], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const downloadLink = document.createElement("a");
+        downloadLink.href = url;
+        downloadLink.download = fileName;
+        document.body.appendChild(downloadLink);
+        downloadLink.click();
+        downloadLink.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+
+        if (navigator.clipboard?.writeText) {
+          navigator.clipboard
+            .writeText(jsonStr)
+            .then(() =>
+              showToast("Architectural JSON downloaded and copied to clipboard."),
+            )
+            .catch(() => showToast("Architectural JSON specification downloaded."));
+        } else {
+          showToast("Architectural JSON specification downloaded.");
+        }
+      }
+
+      // In-app Toast message
+      function showToast(msg) {
+        const toast = document.getElementById("toastMessage");
+        const text = document.getElementById("toastText");
+        text.innerText = msg;
+        toast.classList.remove("opacity-0", "translate-y-20");
+        toast.classList.add("opacity-100", "translate-y-0");
+
+        setTimeout(() => {
+          toast.classList.add("opacity-0", "translate-y-20");
+          toast.classList.remove("opacity-100", "translate-y-0");
+        }, 3000);
+      }
+    </script>
+  </body>
+</html>
