@@ -14,7 +14,6 @@ from studio_db import StudioDB, html_to_text, is_repository_manuscript_path
 
 CONTEXT_OPTIONS = (
     "plot",
-    "outline",
     "science",
     "character",
     "subtext",
@@ -84,7 +83,6 @@ def _supporting_markdown(project: dict[str, Any], option: str) -> list[tuple[str
 
     keywords = {
         "plot": ("plot", "narrative", "story", "arc", "beat", "timeline", "ledger", "continuity", "structure"),
-        "outline": ("outline", "chapter", "scene", "story", "plot", "narrative", "arc", "plan", "ledger"),
         "science": ("science", "research", "technology", "physics", "biology", "medical", "world", "setting", "lore", "reference", "outpost"),
         "character": ("character", "cast", "people", "persona", "profile", "dynamics", "protagonist", "antagonist", "relationship"),
         "subtext": ("subtext", "theme", "historical", "alignment", "audit"),
@@ -231,25 +229,6 @@ def build_context_package(
         for track in intelligence["tracks"]
         if any(int(number) in scene_numbers for number in track["appearances"])
     ]
-
-    if "outline" in selected_options:
-        outline_lines = []
-        for chapter_number in sorted(scene_by_chapter):
-            chapter_scenes = scene_by_chapter[chapter_number]
-            title = chapter_scenes[0].get("chapter_title") or f"Chapter {chapter_number}"
-            outline_lines.append(f"### Chapter {chapter_number}: {title}")
-            for scene in chapter_scenes:
-                outline_lines.append(
-                    f"- Scene {scene.get('scene_number_in_chapter') or scene['scene_number']}: {scene['title']} ({scene['word_count']} words)"
-                )
-        outline_body = "\n".join(outline_lines)
-        outline_docs = _supporting_docs_body(project, "outline")
-        sections.append(
-            _section(
-                "Chapter and scene outline",
-                outline_body + "\n\n### Source outline and planning material\n\n" + outline_docs,
-            )
-        )
 
     if "plot" in selected_options:
         plot_docs = _supporting_docs_body(project, "plot")

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -50,6 +51,44 @@ def _normalise_root(value: str | None, base: Path | None = None) -> Path | None:
         return path.resolve()
     except OSError:
         return None
+
+
+def live_source_state(project: dict[str, Any]) -> dict[str, Any]:
+    """Read branch, commit, and dirty state from the configured checkout.
+
+    ``project_meta`` stores the provenance captured at intake, but Git can
+    change afterward (including untracked files). Project listings must not
+    present that historical snapshot as the current worktree state.
+    """
+    root = _normalise_root(project.get("source_root"))
+    if root is None or not root.is_dir():
+        return {}
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() or None
+        commit_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return {
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "working_tree_dirty": bool(status),
+    }
 
 
 def fictionforce_projects() -> dict[str, list[Path]]:
@@ -92,7 +131,9 @@ class ProjectManager:
                 if not PROJECT_ID_PATTERN.fullmatch(project_id):
                     continue
                 try:
-                    projects.append(StudioDB(path, project_id).project_info())
+                    project = StudioDB(path, project_id).project_info()
+                    project.update(live_source_state(project))
+                    projects.append(project)
                 except (KeyError, OSError):
                     continue
             return projects

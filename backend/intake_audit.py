@@ -53,14 +53,9 @@ def _structural_audit(scenes: list[dict[str, Any]], graph: dict[str, Any]) -> di
                 "evidence": f"{scene['word_count']} words represented as {paragraph_count} paragraph.",
                 "recommendation": "Review source paragraph boundaries before treating this scene as structurally complete.",
             })
-        if re.match(r"^Scene \d+$", scene["title"], flags=re.IGNORECASE):
-            issues.append({
-                "kind": "scene_title",
-                "severity": "medium",
-                "scene_number": scene["scene_number"],
-                "evidence": f"Imported title is '{scene['title']}'.",
-                "recommendation": "Confirm whether the source had an internal scene title that was not recognized.",
-            })
+        # An internal scene title is optional. Do not turn the importer’s old
+        # placeholder labels ("Scene 1") into structural errors: a chapter
+        # may legitimately be one untitled scene.
 
     for (chapter_number, chapter_title), chapter_scenes in chapters.items():
         local_numbers = sorted(

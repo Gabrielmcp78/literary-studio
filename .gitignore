@@ -8,9 +8,11 @@ __pycache__/
 frontend/node_modules/
 frontend/.next/
 
-# Runtime state: per-project SQLite stores, snapshots, exports, backups.
+# Runtime state: per-project SQLite stores, snapshots, exports, backups, and
+# scratch files intentionally kept outside manuscript Git checkouts.
 # These are the Studio's persistent data, not source. Back them up separately.
 build_artifacts/
+.runtime/
 graphify-out/
 
 # Secrets

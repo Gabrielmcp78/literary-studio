@@ -9,6 +9,7 @@ from typing import Any
 
 from ai_provider import AIProviderUnavailable, generate_text
 from governance import GovernanceError, check_batch, current_source_state, prose_law_status, validate_candidate
+from mechanical_review import MechanicalReviewError, review_replacements
 from persona_catalog import get_panel, get_persona
 from studio_db import StudioDB, html_to_text
 
@@ -44,6 +45,17 @@ def check_approval_conflicts(db: StudioDB, batch_id: str, proposal_id: str | Non
         raise ApprovalBridgeError(str(exc)) from exc
 
 
+def _proposal_context(scene: dict[str, Any], original: str) -> str:
+    """Give the mechanical pass enough surrounding text to judge sentence mechanics."""
+    scene_text = html_to_text(scene.get("content_html", ""))
+    position = scene_text.find(original)
+    if position < 0:
+        return scene_text[:1200]
+    start = max(0, position - 500)
+    end = min(len(scene_text), position + len(original) + 500)
+    return scene_text[start:end]
+
+
 def prepare_for_approval(
     db: StudioDB,
     *,
@@ -53,6 +65,8 @@ def prepare_for_approval(
     include: list[str] | None = None,
     persona_ids: list[str] | None = None,
     panel_id: str | None = None,
+    allowed_providers: tuple[str, ...] | None = None,
+    preferred_provider: str | None = None,
 ) -> dict[str, Any]:
     """Turn an author request into validated, source-pinned proposals.
 
@@ -175,6 +189,8 @@ SOURCE-PINNED SCENE EVIDENCE:
             prompt,
             model=os.getenv("LITERARY_STUDIO_APPROVAL_MODEL", "gemini-3.1-pro-preview"),
             temperature=0.1,
+            allowed_providers=allowed_providers,
+            preferred_provider=preferred_provider,
         )
     except AIProviderUnavailable as exc:
         raise ApprovalBridgeError(str(exc)) from exc
@@ -185,6 +201,7 @@ SOURCE-PINNED SCENE EVIDENCE:
     by_scene = {scene["scene_number"]: scene for scene in selected}
     staged: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    candidates_for_mechanical_review: list[dict[str, Any]] = []
     for candidate in parsed.get("proposals", []):
         if not isinstance(candidate, dict):
             rejected.append({"reason": "Proposal was not an object."})
@@ -203,7 +220,69 @@ SOURCE-PINNED SCENE EVIDENCE:
         if not original or not replacement.strip() or original == replacement:
             rejected.append({"candidate": candidate, "reason": "Proposal has an empty or unchanged text span."})
             continue
+        candidates_for_mechanical_review.append(
+            {
+                "id": f"proposal-{len(candidates_for_mechanical_review)}",
+                "candidate": candidate,
+                "scene": scene,
+                "scene_number": scene_number,
+                "original": original,
+                "replacement": replacement,
+            }
+        )
+
+    mechanical_items = [
+        {
+            "id": item["id"],
+            "original": item["original"],
+            "replacement": item["replacement"],
+            "context": _proposal_context(item["scene"], item["original"]),
+        }
+        for item in candidates_for_mechanical_review
+    ]
+    mechanical: dict[str, Any] = {"provider": None, "model": None, "fallback_reasons": [], "items": {}}
+    if mechanical_items:
+        try:
+            mechanical_allowed_providers = allowed_providers or ("gemini", "agy")
+            mechanical = review_replacements(
+                mechanical_items,
+                allowed_providers=mechanical_allowed_providers,
+                preferred_provider=preferred_provider or os.getenv("LITERARY_STUDIO_EDITORIAL_PROVIDER", "auto"),
+            )
+        except MechanicalReviewError as exc:
+            for item in candidates_for_mechanical_review:
+                rejected.append({
+                    "candidate": item["candidate"],
+                    "reason": f"Mechanical spelling and copy-edit pass failed closed: {exc}",
+                })
+            candidates_for_mechanical_review = []
+
+    for item in candidates_for_mechanical_review:
+        candidate = item["candidate"]
+        scene = item["scene"]
+        original = item["original"]
+        reviewed = mechanical["items"][item["id"]]
+        replacement = reviewed["replacement_text"]
+        if not replacement.strip() or original == replacement:
+            rejected.append({
+                "candidate": candidate,
+                "reason": "The mechanical pass produced an empty or unchanged text span.",
+                "mechanical_review": reviewed,
+            })
+            continue
         validation = validate_candidate(project, scene, original, replacement)
+        validation["mechanical_review"] = {
+            "provider": mechanical["provider"],
+            "model": mechanical["model"],
+            "fallback_reasons": mechanical["fallback_reasons"],
+            "issues": reviewed["issues"],
+            "changed": reviewed["changed"],
+            "applied_correction": True,
+        }
+        if reviewed["issues"]:
+            validation["warnings"].extend(
+                f"Mechanical pass: {issue['description']}" for issue in reviewed["issues"]
+            )
         if validation["errors"]:
             rejected.append({"candidate": candidate, "reason": " ".join(validation["errors"]), "validation": validation})
             continue
@@ -213,7 +292,7 @@ SOURCE-PINNED SCENE EVIDENCE:
         staged.append(
             db.create_staged_proposal(
                 batch_id=batch["batch_id"],
-                scene_number=scene_number,
+                scene_number=item["scene_number"],
                 proposed_by_persona_id=persona_id,
                 proposed_by_name=persona_names.get(persona_id, "Studio Bridge"),
                 change_type=str(candidate.get("change_type") or "other"),
@@ -238,6 +317,12 @@ SOURCE-PINNED SCENE EVIDENCE:
             "persona_ids": persona_ids,
             "panel_id": panel_id,
             "prose_law": prose_law_status(),
+            "mechanical_review": {
+                "provider": mechanical["provider"],
+                "model": mechanical["model"],
+                "fallback_reasons": mechanical["fallback_reasons"],
+                "required": True,
+            },
         },
     }
     db.update_approval_batch(batch["batch_id"], result=result, status="pending" if staged else "closed")

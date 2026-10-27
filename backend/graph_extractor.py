@@ -95,6 +95,7 @@ def build_graph(scenes: list[dict[str, object]]) -> tuple[list[dict[str, str]], 
     entity_strength: dict[tuple[str, str], bool] = {}
 
     ordered_scenes = sorted(scenes, key=lambda scene: int(scene["scene_number"]))
+    previous_scene_id: str | None = None
     for scene in ordered_scenes:
         number = int(scene["scene_number"])
         scene_id = f"scene:{number}"
@@ -107,13 +108,19 @@ def build_graph(scenes: list[dict[str, object]]) -> tuple[list[dict[str, str]], 
             ),
             "node_type": "scene",
         }
-        if number > 1:
-            edges.add((f"scene:{number - 1}", scene_id, "NEXT_SCENE"))
+        # Scene numbers are stable database identifiers, not necessarily a
+        # contiguous sequence: a source repair can remove scenes and later
+        # recompile additional scenes with new IDs. Link the ordered roster,
+        # not ``number - 1``, so graph rebuilds never create an edge to a
+        # deleted scene node.
+        if previous_scene_id is not None:
+            edges.add((previous_scene_id, scene_id, "NEXT_SCENE"))
         for entity in extract_scene_entities(str(scene["content_text"]), number):
             entity_key = (entity.label.casefold(), entity.node_type)
             entity_scenes.setdefault(entity_key, set()).add(number)
             entity_labels.setdefault(entity_key, entity.label)
             entity_strength[entity_key] = entity_strength.get(entity_key, False) or entity.strong
+        previous_scene_id = scene_id
 
     for (normalized, node_type), scene_numbers in sorted(entity_scenes.items()):
         if node_type == "character" and not entity_strength[(normalized, node_type)] and len(scene_numbers) < 2:

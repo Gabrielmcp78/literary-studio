@@ -1,9 +1,9 @@
 """Provider routing for Literary Studio's explicit AI operations.
 
-Gemini remains the primary provider when it is configured. AGY is the
-terminal-level fallback: it is invoked in print/sandbox mode. Intake uses
-this router only when the intake oversight audit is explicitly run; it never
-silently rewrites manuscript prose.
+Gemini remains the primary provider when it is configured. Ollama's GPT-OSS
+120B cloud model is the preferred configured fallback, followed by AGY as the
+terminal-level fallback. Intake uses this router only when the intake oversight
+audit is explicitly run; it never silently rewrites manuscript prose.
 """
 
 from __future__ import annotations
@@ -17,6 +17,10 @@ import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+from config import load_environment
+
+load_environment()
 
 try:
     from google import genai
@@ -117,7 +121,7 @@ def _run_agy(prompt: str) -> AIResponse:
         "--print-timeout",
         timeout,
     ]
-    configured_model = os.getenv("LITERARY_STUDIO_AGY_MODEL")
+    configured_model = os.getenv("LITERARY_STUDIO_AGY_MODEL", "claude-opus-5-5-high")
     if configured_model:
         command.extend(["--model", configured_model])
 
@@ -184,8 +188,14 @@ def _run_fmod(prompt: str, system_instruction: str | None = None) -> AIResponse:
 
 def _run_ollama(prompt: str, system_instruction: str | None = None) -> AIResponse:
     host = os.getenv("LITERARY_STUDIO_OLLAMA_HOST", os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")).rstrip("/")
-    model = os.getenv("LITERARY_STUDIO_OLLAMA_MODEL", "llama3.1:8b")
-    request_body: dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
+    model = os.getenv("LITERARY_STUDIO_OLLAMA_MODEL", "gpt-oss:120b-cloud")
+    num_ctx = max(int(os.getenv("LITERARY_STUDIO_OLLAMA_NUM_CTX", "131072")), 8192)
+    request_body: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"num_ctx": num_ctx},
+    }
     if system_instruction:
         request_body["system"] = system_instruction
     request = urllib.request.Request(
@@ -210,47 +220,125 @@ def _run_ollama(prompt: str, system_instruction: str | None = None) -> AIRespons
     return AIResponse(text=text, provider="ollama", model=model)
 
 
+def _run_openrouter(
+    prompt: str,
+    system_instruction: str | None = None,
+    temperature: float = 0.2,
+) -> AIResponse:
+    """Call OpenRouter's OpenAI-compatible chat-completions endpoint."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise AIProviderUnavailable("OpenRouter is not configured: OPENROUTER_API_KEY is empty.")
+
+    model = os.getenv(
+        "LITERARY_STUDIO_OPENROUTER_MODEL",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+    )
+    messages: list[dict[str, str]] = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": prompt})
+    request_body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:3000",
+            "X-OpenRouter-Title": "Literary Studio",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=max(int(os.getenv("LITERARY_STUDIO_OPENROUTER_TIMEOUT", "180")), 1),
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[-1000:]
+        raise AIProviderUnavailable(f"OpenRouter returned HTTP {exc.code}: {detail}") from exc
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise AIProviderUnavailable(f"OpenRouter unavailable: {exc}") from exc
+
+    if payload.get("error"):
+        raise AIProviderUnavailable(f"OpenRouter returned an error: {payload['error']}")
+    try:
+        text = str(payload["choices"][0]["message"]["content"]).strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise AIProviderUnavailable("OpenRouter returned no assistant message.") from exc
+    if not text:
+        raise AIProviderUnavailable("OpenRouter returned an empty response.")
+    return AIResponse(text=text, provider="openrouter", model=model)
+
+
 def generate_text(
     prompt: str,
     *,
-    model: str,
+    model: str = "gemini-3.1-pro-preview",
     temperature: float = 0.2,
     system_instruction: str | None = None,
+    preferred_provider: str | None = None,
+    allowed_providers: tuple[str, ...] | None = None,
 ) -> AIResponse:
-    """Use Gemini first, then AGY, Apple FoundationModels, and Ollama."""
+    """Route across providers: Gemini, OpenRouter, Ollama GPT-OSS, AGY, and FModCLI.
 
-    primary_error: Exception | None = None
-    if genai is not None and types is not None and (
-        os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    ):
-        try:
-            client = genai.Client()
-            config_kwargs: dict[str, Any] = {"temperature": temperature}
-            if system_instruction:
-                config_kwargs["system_instruction"] = system_instruction
-            config = types.GenerateContentConfig(**config_kwargs)
-            response = client.models.generate_content(model=model, contents=prompt, config=config)
-            text = (response.text or "").strip()
-            if text:
-                return AIResponse(text=text, provider="gemini", model=model)
-            primary_error = RuntimeError("Gemini returned an empty response.")
-        except Exception as exc:  # Fallback is specifically for provider failures.
-            primary_error = exc
+    If preferred_provider is specified (or LITERARY_STUDIO_DEFAULT_PROVIDER is set),
+    that provider is attempted first, falling back to the remaining chain on failure.
+    """
+    chosen = (
+        (preferred_provider or os.getenv("LITERARY_STUDIO_DEFAULT_PROVIDER", "")).strip().lower()
+    )
+    if chosen in {"", "auto"}:
+        chosen = "auto"
+
+    def _call_gemini() -> AIResponse:
+        if genai is None or types is None:
+            raise AIProviderUnavailable("Gemini: google-genai is not installed.")
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            raise AIProviderUnavailable("Gemini: GEMINI_API_KEY / GOOGLE_API_KEY is not set.")
+        client = genai.Client()
+        config_kwargs: dict[str, Any] = {"temperature": temperature}
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+        config = types.GenerateContentConfig(**config_kwargs)
+        response = client.models.generate_content(model=model, contents=prompt, config=config)
+        text = (response.text or "").strip()
+        if not text:
+            raise AIProviderUnavailable("Gemini returned an empty response.")
+        return AIResponse(text=text, provider="gemini", model=model)
+
+    provider_map = {
+        "gemini": _call_gemini,
+        "openrouter": lambda: _run_openrouter(prompt, system_instruction, temperature),
+        "ollama": lambda: _run_ollama(prompt, system_instruction),
+        "agy": lambda: _run_agy(prompt),
+        "fmodcli": lambda: _run_fmod(prompt, system_instruction),
+    }
+    allowed = tuple(dict.fromkeys(allowed_providers or provider_map.keys()))
+    unknown = [provider for provider in allowed if provider not in provider_map]
+    if unknown:
+        raise AIProviderUnavailable(f"Unknown AI provider restriction: {', '.join(unknown)}")
+    if not allowed:
+        raise AIProviderUnavailable("No AI providers are allowed for this operation.")
+
+    if chosen != "auto" and chosen in allowed:
+        ordered_providers = [chosen] + [p for p in allowed if p != chosen]
+    else:
+        ordered_providers = [p for p in ("gemini", "openrouter", "ollama", "agy", "fmodcli") if p in allowed]
 
     errors: list[str] = []
-    if primary_error:
-        errors.append(f"Gemini: {primary_error}")
-    elif genai is None or types is None:
-        errors.append("Gemini: google-genai is not installed.")
-    else:
-        errors.append("Gemini: GEMINI_API_KEY / GOOGLE_API_KEY is not set for the backend.")
-    for fallback in (
-        lambda: _run_agy(prompt),
-        lambda: _run_fmod(prompt, system_instruction),
-        lambda: _run_ollama(prompt, system_instruction),
-    ):
+    for prov_name in ordered_providers:
+        call_fn = provider_map[prov_name]
         try:
-            return replace(fallback(), fallback_reasons=tuple(errors))
-        except AIProviderUnavailable as exc:
-            errors.append(str(exc))
+            res = call_fn()
+            return replace(res, fallback_reasons=tuple(errors))
+        except (AIProviderUnavailable, Exception) as exc:
+            errors.append(f"{prov_name}: {exc}")
+
     raise AIProviderUnavailable("; ".join(errors))

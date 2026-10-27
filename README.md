@@ -37,6 +37,7 @@ Markdown on the pinned branch and committed, one commit per batch.
 cd backend
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
+# Copy .env.example to .env and enter GEMINI_API_KEY there.
 venv/bin/uvicorn main:app --reload --port 8000
 
 cd ../frontend
@@ -49,11 +50,27 @@ Register the MCP bridge with Claude Desktop or an IDE: see
 
 ## Configuration
 
+### Launch from a macOS icon
+
+Double-click `Literary Studio.app` in this repository, or drag it to the Dock.
+It starts the backend and frontend from the checked-out environment, waits for
+both health checks, and opens `http://127.0.0.1:3000/`. No IDE or interactive
+terminal is required. Runtime logs and PID files are kept in `.runtime/`.
+
+The app reads provider keys from `backend/.env`; that file remains local and is
+never copied into the bundle. To stop the services without opening a terminal,
+run `scripts/stop_literary_studio.zsh` from a Finder shortcut or use Activity
+Monitor for the two processes.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | unset | Enables Gemini, the primary provider. Without it the chain falls back to AGY. |
+| `OPENROUTER_API_KEY`, `LITERARY_STUDIO_OPENROUTER_MODEL` | unset, `nvidia/nemotron-3-ultra-550b-a55b:free` | OpenRouter provider and model; used after Gemini and before Ollama. |
 | `LITERARY_STUDIO_APPROVAL_MODEL` | `gemini-3.1-pro-preview` | Model for approval preparation. |
-| `LITERARY_STUDIO_AGY_BIN`, `LITERARY_STUDIO_AGY_MODEL` | `agy` on PATH, CLI default | AGY fallback. |
+| `LITERARY_STUDIO_AGY_BIN`, `LITERARY_STUDIO_AGY_MODEL` | `agy` on PATH, `claude-opus-5-5-high` | AGY fallback and model selection. |
+| `LITERARY_STUDIO_OLLAMA_MODEL`, `LITERARY_STUDIO_OLLAMA_NUM_CTX` | `gpt-oss:120b-cloud`, `131072` | Ollama model and context size; preferred after Gemini. |
+| `LITERARY_STUDIO_CARD_CONTEXT_CHARS` | `200000` | Maximum supporting-card context; manuscript prose is not truncated by this setting. |
+| `LITERARY_STUDIO_ROLEPLAY_HISTORY_CHARS` | `64000` | Recent roleplay-memory budget; durable history remains stored. |
 | `FICTIONFORCE_ROOT` | `/Volumes/Ready500/DEVELOPMENT/fiction-git-system` | Where prose law is loaded from. |
 | `FICTIONFORCE_CONFIG` | `$FICTIONFORCE_ROOT/fiction.config.json` | Registry join with FictionForce. |
 | `LITERARY_STUDIO_PROSE_LAW` | `on` | `off` disables prose-law enforcement. |
@@ -86,3 +103,15 @@ Register the MCP bridge with Claude Desktop or an IDE: see
   Studio-only accept instead.
 - Back up `build_artifacts/projects/*.sqlite3`; they are runtime state and are
   not in Git.
+- New scratch pages are stored under
+  `build_artifacts/projects/<project-id>/scratch/`, which is ignored runtime
+  state outside the linked manuscript checkout. To make prose canonical, copy
+  or move it into an actual chapter Markdown file; chapter-linked files remain
+  subject to the normal source and Approval Desk workflow.
+- Governance also provides an explicit `Override dirty-tree guard` action. It
+  requires a second confirmation and commits only files changed by the saved
+  Studio desk; unrelated dirty files remain untouched. If an approved batch's
+  source file was already dirty, the Approval Desk offers the same override,
+  with a warning that same-file edits will be included. These actions create
+  local commits on the current branch; they do not silently push to a remote
+  or merge branches.

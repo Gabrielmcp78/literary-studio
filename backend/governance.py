@@ -12,8 +12,8 @@ Three guarantees live here:
    is gone or ambiguous, or the branch changed.
 3. Accepting writes the change back to the Markdown source on the pinned
    branch. Each batch becomes one Git commit when its last proposal is
-   reviewed. Source files carrying the author's own uncommitted edits are
-   never touched, so the commit never sweeps up work-in-progress.
+   reviewed. A dirty source file is only changed by an exact anchored
+   write-back, and preexisting dirty work is never swept into the commit.
 
 Imports
 - hashlib: SHA-256 file fingerprints. https://docs.python.org/3/library/hashlib.html
@@ -50,7 +50,8 @@ from pathlib import Path
 from typing import Any
 
 from source_snapshot import SnapshotError, build_snapshot
-from studio_db import StudioDB, html_to_text, unique_html_anchor, utc_now
+from studio_db import StudioDB, html_to_text, is_project_local_scratch_path, unique_html_anchor, utc_now
+from compiler_engine import html_to_markdown
 
 
 FICTIONFORCE_ROOT = Path(
@@ -92,7 +93,10 @@ def _git(root: Path, *args: str) -> str:
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = (getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)).strip()
         raise GovernanceError(f"git {args[0]} failed: {detail}", "git_failed") from exc
-    return result.stdout.strip()
+    # Preserve leading spaces: porcelain Git status uses the first two
+    # columns for index/worktree state, so ``strip()`` would erase a clean
+    # index column from the first entry and corrupt its displayed path.
+    return result.stdout.rstrip()
 
 
 def _sha256(data: bytes) -> str:
@@ -113,18 +117,37 @@ def repo_root(source_root: str | None) -> Path:
 
 
 def source_file(project: dict[str, Any], scene: dict[str, Any]) -> tuple[Path, str] | None:
-    """Return (absolute path, repo-relative path) of a scene's Markdown source, or None."""
+    """Return (absolute path, repo-relative path) of a scene's Markdown source.
+
+    Repository-folder imports may retain a project-folder prefix such as
+    ``string-theories-v11/manuscript/...`` even after the checkout is linked.
+    Resolve that legacy intake path only when the stripped path exists inside
+    the configured source scope, and return the real Git-relative path for
+    write-back and status tracking.
+    """
     relative = (scene.get("source_path") or "").strip()
     if not relative:
+        return None
+    if is_project_local_scratch_path(relative):
         return None
     try:
         root = repo_root(project.get("source_root"))
     except GovernanceError:
         return None
-    path = (root / relative).resolve()
-    if root not in path.parents or not path.is_file():
-        return None
-    return path, relative
+    candidates = [Path(relative)]
+    project_id = str(project.get("project_id") or "").strip()
+    prefix = f"{project_id}/"
+    if project_id and relative.startswith(prefix):
+        candidates.append(Path(relative[len(prefix):]))
+
+    scope = project.get("source_subpath")
+    scope_root = (root / scope).resolve() if scope else root
+    for candidate in candidates:
+        path = (root / candidate).resolve()
+        if root not in path.parents or scope_root not in path.parents or not path.is_file():
+            continue
+        return path, path.relative_to(root).as_posix()
+    return None
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -182,6 +205,84 @@ def current_source_state(db: StudioDB) -> dict[str, Any]:
         }
     )
     return state
+
+
+def source_worktree_status(db: StudioDB) -> dict[str, Any]:
+    """Return a read-only, file-level view of the configured source checkout."""
+    project = db.project_info()
+    root = repo_root(project.get("source_root"))
+    raw = _git(root, "status", "--porcelain=v1", "--untracked-files=all")
+    files: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if len(line) < 3:
+            continue
+        code = line[:2]
+        path = line[3:]
+        staged = code[0] not in {" ", "?"}
+        unstaged = code[1] not in {" ", "?"}
+        untracked = code == "??"
+        files.append(
+            {
+                "path": path,
+                "status_code": code,
+                "staged": staged,
+                "unstaged": unstaged,
+                "untracked": untracked,
+                "label": "untracked" if untracked else "staged and unstaged" if staged and unstaged else "staged" if staged else "modified",
+            }
+        )
+    return {
+        "source_root": str(root),
+        "source_subpath": project.get("source_subpath"),
+        "branch": _git(root, "branch", "--show-current") or None,
+        "commit_sha": _git(root, "rev-parse", "HEAD"),
+        "working_tree_dirty": bool(files),
+        "files": files,
+        "counts": {
+            "total": len(files),
+            "staged": sum(1 for item in files if item["staged"]),
+            "unstaged": sum(1 for item in files if item["unstaged"]),
+            "untracked": sum(1 for item in files if item["untracked"]),
+        },
+        "read_status": "live_worktree",
+        "checked_at": utc_now(),
+    }
+
+
+def source_worktree_diff(db: StudioDB, relative_path: str) -> dict[str, Any]:
+    """Return a bounded read-only diff for one currently dirty file."""
+    status = source_worktree_status(db)
+    item = next((entry for entry in status["files"] if entry["path"] == relative_path), None)
+    if item is None:
+        raise GovernanceError("That file is not currently dirty in the configured source checkout.", "source_file_not_dirty")
+    root = Path(status["source_root"])
+    path = (root / relative_path).resolve()
+    if path == root or root not in path.parents or not path.is_file():
+        raise GovernanceError("That source path is not a readable file in the configured checkout.", "source_file_unavailable")
+    if item["untracked"]:
+        command = ["git", "-C", str(root), "diff", "--no-index", "--no-color", "/dev/null", str(path)]
+    else:
+        command = ["git", "-C", str(root), "diff", "HEAD", "--no-color", "--", relative_path]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GovernanceError(f"Unable to read the diff for {relative_path}.", "git_failed") from exc
+    diff = result.stdout.decode("utf-8", errors="replace")
+    truncated = len(diff) > 200_000
+    if truncated:
+        diff = diff[:200_000] + "\n[…diff truncated at 200 KB…]\n"
+    return {
+        "path": relative_path,
+        "label": item["label"],
+        "status_code": item["status_code"],
+        "diff": diff or "(No textual diff available; this may be a binary file.)",
+        "truncated": truncated,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -247,7 +348,14 @@ def _balance_problems(original: str, replacement: str) -> list[str]:
     return problems
 
 
-def validate_candidate(project: dict[str, Any], scene: dict[str, Any], original: str, replacement: str) -> dict[str, Any]:
+def validate_candidate(
+    project: dict[str, Any],
+    scene: dict[str, Any],
+    original: str,
+    replacement: str,
+    *,
+    allow_multiline: bool = False,
+) -> dict[str, Any]:
     """Decide whether a candidate proposal may enter the desk.
 
     Parameters: project - project_info(); scene - the target scene;
@@ -259,17 +367,18 @@ def validate_candidate(project: dict[str, Any], scene: dict[str, Any], original:
     """
     errors: list[str] = []
     warnings: list[str] = []
-    if "\n" in original or "\n\n" in replacement:
+    if not allow_multiline and ("\n" in original or "\n\n" in replacement):
         errors.append("The change crosses a paragraph boundary; proposals must stay inside one paragraph.")
     scene_text = html_to_text(scene.get("content_html", ""))
-    occurrences = scene_text.count(original)
-    if occurrences == 0:
-        errors.append("The original text was not found in the scene.")
-    elif occurrences > 1:
-        errors.append(f"The original text appears {occurrences} times in the scene; it must be unique.")
-    elif unique_html_anchor(scene.get("content_html", ""), original) is None:
-        errors.append("The original text spans italic, bold, or link formatting and cannot be replaced exactly.")
-    unbalanced = _balance_problems(original, replacement)
+    if not allow_multiline:
+        occurrences = scene_text.count(original)
+        if occurrences == 0:
+            errors.append("The original text was not found in the scene.")
+        elif occurrences > 1:
+            errors.append(f"The original text appears {occurrences} times in the scene; it must be unique.")
+        elif unique_html_anchor(scene.get("content_html", ""), original) is None:
+            errors.append("The original text spans italic, bold, or link formatting and cannot be replaced exactly.")
+    unbalanced = [] if allow_multiline else _balance_problems(original, replacement)
     if unbalanced:
         errors.append(f"The replacement unbalances {', '.join(unbalanced)}.")
     if replacement != replacement.strip() and original == original.strip():
@@ -372,8 +481,44 @@ def check_batch(db: StudioDB, batch_id: str, proposal_id: str | None = None) -> 
             conflicts.append({"kind": "scene_missing", "proposal_id": pid, "scene_number": number,
                               "message": "The scene no longer exists."})
             continue
-        count = html_to_text(scene["content_html"]).count(original)
-        if count != 1 or unique_html_anchor(scene["content_html"], original) is None:
+        manual_sync = proposal.get("change_type") == "manual_editor_sync"
+        if manual_sync and proposal.get("source_scene_version") is not None and int(scene.get("version", 0)) != int(proposal["source_scene_version"]):
+            # Manual sync writes the exact original passage back to Markdown;
+            # the Studio scene already contains the author's saved replacement.
+            # A later Studio revision is therefore not, by itself, a conflict.
+            # The source-passage check below remains the blocking safeguard.
+            warnings.append({
+                "kind": "studio_scene_version_moved",
+                "proposal_id": pid,
+                "scene_number": number,
+                "message": "The Studio scene changed after manual sync preparation; the exact Markdown passage was re-checked before applying.",
+            })
+        if manual_sync:
+            located = source_file(db.project_info(), scene)
+            if located:
+                source_text = located[0].read_text(encoding="utf-8", errors="replace")
+                count = source_text.count(original)
+            else:
+                # A reintaked project may have no Git checkout. Its exact
+                # original is retained in the import revision while the live
+                # scene contains the author's saved replacement.
+                import_baseline = next(
+                    (
+                        revision
+                        for revision in reversed(db.scene_history(int(number)))
+                        if revision.get("source") == "import"
+                    ),
+                    None,
+                )
+                baseline_text = (
+                    html_to_markdown(import_baseline["content_html"])
+                    if import_baseline
+                    else ""
+                )
+                count = baseline_text.count(original)
+        else:
+            count = html_to_text(scene["content_html"]).count(original)
+        if count != 1 or (not manual_sync and unique_html_anchor(scene["content_html"], original) is None):
             conflicts.append({
                 "kind": "passage_changed",
                 "proposal_id": pid,
@@ -414,12 +559,18 @@ def check_batch(db: StudioDB, batch_id: str, proposal_id: str | None = None) -> 
 # --------------------------------------------------------------------------- #
 
 
-def write_back(db: StudioDB, proposal: dict[str, Any], scene: dict[str, Any]) -> dict[str, Any]:
+def write_back(
+    db: StudioDB,
+    proposal: dict[str, Any],
+    scene: dict[str, Any],
+    *,
+    allow_dirty: bool = False,
+) -> dict[str, Any]:
     """Patch the proposal into its Markdown source file on the pinned branch.
 
-    Behavior: verifies branch, that the file has no uncommitted edits other
-    than this batch's own earlier write-backs, and that the original text is
-    unique in the file; then rewrites atomically.
+    Behavior: verifies branch and that the original text is unique in the
+    file; a dirty file is allowed only for an exact anchored write-back, and
+    any preexisting dirty state is recorded so it cannot be auto-committed.
     Returns {path, absolute_path, sha_before, sha_after, previous_bytes} for
     recording and rollback.
     Failure: GovernanceError with code branch_changed | source_dirty |
@@ -450,9 +601,10 @@ def write_back(db: StudioDB, proposal: dict[str, Any], scene: dict[str, Any]) ->
     current_sha = _sha256(current_bytes)
     ledger = batch.get("writeback") or {}
     ours = ledger.get("files", {}).get(relative)
-    if _git(root, "status", "--porcelain", "--", relative) and ours != current_sha:
+    dirty_before = bool(_git(root, "status", "--porcelain", "--", relative) and ours != current_sha)
+    if dirty_before and not allow_dirty:
         raise GovernanceError(
-            f"{relative} has uncommitted edits that aren't from this batch. Commit or stash them, or accept in Studio only.",
+            f"{relative} has uncommitted edits. Use the explicit dirty-worktree apply action to preserve them and write only this anchored change.",
             "source_dirty",
         )
 
@@ -472,6 +624,7 @@ def write_back(db: StudioDB, proposal: dict[str, Any], scene: dict[str, Any]) ->
         "sha_before": current_sha,
         "sha_after": _sha256(updated),
         "previous_bytes": current_bytes,
+        "dirty_before": dirty_before,
     }
 
 
@@ -486,6 +639,10 @@ def record_write(db: StudioDB, batch_id: str, proposal_id: str, write: dict[str,
     ledger = batch.get("writeback") or {"files": {}, "written": []}
     ledger.setdefault("files", {})[write["path"]] = write["sha_after"]
     ledger.setdefault("written", []).append({"proposal_id": proposal_id, "path": write["path"], "at": utc_now()})
+    if write.get("dirty_before"):
+        dirty_files = set(ledger.get("preexisting_dirty_files", []))
+        dirty_files.add(write["path"])
+        ledger["preexisting_dirty_files"] = sorted(dirty_files)
     db.update_approval_batch(batch_id, writeback=ledger)
 
 
@@ -502,7 +659,12 @@ def _commit_message(batch: dict[str, Any], written_ids: set[str]) -> str:
     return "\n".join(lines)
 
 
-def commit_batch(db: StudioDB, batch_id: str) -> dict[str, Any]:
+def commit_batch(
+    db: StudioDB,
+    batch_id: str,
+    *,
+    override_dirty: bool = False,
+) -> dict[str, Any]:
     """Commit a batch's written-back files as one Git commit.
 
     Behavior: commits only the batch's files (git commit --only), leaving any
@@ -521,6 +683,16 @@ def commit_batch(db: StudioDB, batch_id: str) -> dict[str, Any]:
     files: dict[str, str] = ledger.get("files", {})
     if not files:
         return {"committed": False, "reason": "No source files were changed by this batch."}
+    if ledger.get("preexisting_dirty_files") and not override_dirty:
+        return {
+            "committed": False,
+            "reason": "preexisting_source_dirty",
+            "files": sorted(files),
+            "message": (
+                "The approved write-back is complete, but commit is deferred because the source file "
+                "already had unrelated uncommitted edits. Review and commit that file from the Revision-11 workspace."
+            ),
+        }
 
     project = db.project_info()
     try:
@@ -543,8 +715,81 @@ def commit_batch(db: StudioDB, batch_id: str) -> dict[str, Any]:
         raise
     ledger.pop("commit_error", None)
     ledger.update({"commit_sha": commit_sha, "committed_at": utc_now(), "branch": branch})
+    if override_dirty and ledger.get("preexisting_dirty_files"):
+        ledger["dirty_override"] = True
     db.update_approval_batch(batch_id, status="committed", writeback=ledger)
-    return {"committed": True, "commit_sha": commit_sha, "branch": branch, "files": sorted(files)}
+    return {
+        "committed": True,
+        "commit_sha": commit_sha,
+        "branch": branch,
+        "files": sorted(files),
+        "dirty_override": bool(override_dirty and ledger.get("preexisting_dirty_files")),
+    }
+
+
+def reconcile_failed_commit_batch(db: StudioDB, batch_id: str) -> dict[str, Any]:
+    """Close a failed ledger entry when its approved replacements are already committed.
+
+    This is intentionally stricter than a normal commit retry: the linked
+    source checkout must be clean and on the pinned branch, and every accepted
+    replacement must already occur verbatim in its recorded source file. No
+    manuscript bytes are written by this operation; only the local governance
+    ledger is reconciled with the current Git commit.
+    """
+    batch = db.get_approval_batch(batch_id)
+    if batch is None:
+        raise GovernanceError("Approval batch not found.", "not_found")
+    if batch.get("status") != "commit_failed":
+        raise GovernanceError("That batch is not a failed commit record.", "not_commit_failed")
+
+    ledger = batch.get("writeback") or {}
+    files = ledger.get("files") if isinstance(ledger, dict) else None
+    if not isinstance(files, dict) or not files:
+        raise GovernanceError("The failed batch has no recorded source files.", "reconcile_unsafe")
+
+    status = source_worktree_status(db)
+    if status.get("working_tree_dirty"):
+        raise GovernanceError("The source checkout is dirty; review it before reconciling this record.", "source_dirty")
+    expected_branch = (batch.get("baseline") or {}).get("branch")
+    if expected_branch and status.get("branch") != expected_branch:
+        raise GovernanceError(
+            f"The source checkout is on {status.get('branch')}, not {expected_branch}.",
+            "branch_changed",
+        )
+
+    root = Path(status["source_root"])
+    source_by_path: dict[str, str] = {}
+    for relative in files:
+        target = (root / relative).resolve()
+        if target == root or root not in target.parents or not target.is_file():
+            raise GovernanceError(f"Recorded source file is unavailable: {relative}", "reconcile_unsafe")
+        source_by_path[relative] = target.read_text(encoding="utf-8")
+
+    for proposal in batch.get("proposals", []):
+        if proposal.get("status") != "accepted":
+            continue
+        replacement = proposal.get("proposed_replacement_text", "")
+        scene = db.get_scene(int(proposal["scene_number"]))
+        relative = scene.get("source_path") if scene else None
+        if not relative or relative not in source_by_path or replacement not in source_by_path[relative]:
+            raise GovernanceError(
+                "The exact approved replacement is not present in the clean source; re-prepare the change.",
+                "reconcile_unsafe",
+            )
+
+    commit_sha = status.get("commit_sha")
+    ledger["commit_sha"] = commit_sha
+    ledger["committed_at"] = utc_now()
+    ledger["resolution"] = "reconciled_existing_clean_source"
+    ledger["resolved_commit_error"] = ledger.get("commit_error")
+    db.update_approval_batch(batch_id, status="committed", writeback=ledger)
+    return {
+        "reconciled": True,
+        "batch_id": batch_id,
+        "commit_sha": commit_sha,
+        "files": sorted(files),
+        "resolution": ledger["resolution"],
+    }
 
 
 def finalize_batch_if_done(db: StudioDB, batch_id: str | None) -> dict[str, Any] | None:
