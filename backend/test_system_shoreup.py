@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from ai_provider import AIProviderUnavailable, AIResponse, generate_text
 from compiler_engine import (
     DEFAULT_AUTHOR,
+    FormatterUnavailable,
     _safe_filename,
     _compact_reader_layout,
     _inject_latex_provenance,
@@ -31,6 +32,8 @@ from manuscript_context import (
     context_prompt,
 )
 from manual_sync import build_manual_change_candidates
+from governance import GovernanceError, reconcile_failed_commit_batch
+from desk_push import commit_scene_to_git, pull_desk_from_git, push_desk_to_git
 from studio_db import (
     StudioDB,
     _markdown_scenes,
@@ -48,6 +51,15 @@ class TestDatabaseConnectionLifecycle(unittest.TestCase):
                 connection.execute("SELECT 1")
             with self.assertRaises(sqlite3.ProgrammingError):
                 connection.execute("SELECT 1")
+
+    def test_database_connection_enables_wal_and_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = StudioDB(Path(temp_dir) / "wal-check.sqlite3", "wal-check")
+            with db._connect() as connection:
+                mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+                timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                self.assertEqual(mode.lower(), "wal")
+                self.assertGreaterEqual(timeout, 5000)
 
 
 class TestPathFiltering(unittest.TestCase):
@@ -194,9 +206,9 @@ class TestCompilerSelection(unittest.TestCase):
             "Test Manuscript",
             "Author",
         )
-        self.assertIn("### 1 | SUBJECT | Buffalo, NY | Present Day", markdown)
-        self.assertIn("### 2 | ANSWER | MIT | April 11, 2005", markdown)
-        self.assertNotIn("First scene.\n\n* * *\n\n### 2", markdown)
+        self.assertIn("### 1.1  SUBJECT | Buffalo, NY | Present Day", markdown)
+        self.assertIn("### 1.2  ANSWER | MIT | April 11, 2005", markdown)
+        self.assertNotIn("First scene.\n\n* * *\n\n### 1.2", markdown)
 
     def test_typesetter_source_emits_named_scene_heading_and_preserves_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -218,8 +230,8 @@ class TestCompilerSelection(unittest.TestCase):
             )
             source = paths[0].read_text(encoding="utf-8")
 
-        self.assertIn("### 1 | SUBJECT | Buffalo, NY | Present Day", source)
-        self.assertLess(source.index("### 1 | SUBJECT"), source.index("Opening prose."))
+        self.assertIn("### 6.1  SUBJECT | Buffalo, NY | Present Day", source)
+        self.assertLess(source.index("### 6.1  SUBJECT"), source.index("Opening prose."))
 
 
 class TestSourceRepairRoster(unittest.TestCase):
@@ -401,6 +413,12 @@ class TestCompilerEngine(unittest.TestCase):
         self.assertIsInstance(profiles, list)
         profile_ids = [p["id"] for p in profiles]
         self.assertTrue("trade_paperback_prh" in profile_ids or "manuscript_submission" in profile_ids)
+
+    def test_list_format_profiles_fallback_when_typesetter_absent(self):
+        with patch("compiler_engine._load_typesetter", side_effect=FormatterUnavailable("simulated absent")):
+            profiles = list_format_profiles()
+            self.assertTrue(len(profiles) >= 2)
+            self.assertEqual(profiles[0]["id"], "manuscript_submission")
 
     def test_markdown_export_carries_full_book_provenance(self):
         markdown = render_markdown_export(
@@ -704,6 +722,181 @@ class TestManualChangeCandidates(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["hunks"][0]["original"], "Original prose.")
         self.assertEqual(candidates[0]["hunks"][0]["replacement"], "Revised prose.")
+
+    def test_reconcile_normalises_project_prefixed_scene_path(self):
+        source_root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(source_root, ignore_errors=True))
+        source_path = source_root / "manuscript" / "chapter.md"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text("Clean replacement.\n", encoding="utf-8")
+
+        db = MagicMock()
+        db.get_approval_batch.return_value = {
+            "status": "commit_failed",
+            "baseline": {"branch": "main"},
+            "writeback": {"files": {"manuscript/chapter.md": "sha"}},
+            "proposals": [
+                {
+                    "status": "accepted",
+                    "scene_number": 1,
+                    "proposed_replacement_text": "Clean replacement.",
+                }
+            ],
+        }
+        db.get_scene.return_value = {
+            "source_path": "string-theories-v11/manuscript/chapter.md"
+        }
+        db.project_info.return_value = {
+            "project_id": "string-theories-v11",
+            "source_root": str(source_root),
+            "source_subpath": "manuscript",
+        }
+        with patch(
+            "governance.source_worktree_status",
+            return_value={
+                "source_root": str(source_root.resolve()),
+                "branch": "main",
+                "commit_sha": "abc123",
+                "working_tree_dirty": False,
+            },
+        ), patch(
+            "governance.source_file",
+            return_value=(source_path, "manuscript/chapter.md"),
+        ):
+            result = reconcile_failed_commit_batch(db, "batch-failed")
+
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(result["commit_sha"], "abc123")
+        db.update_approval_batch.assert_called_once()
+
+
+class TestGitEngineAndSynchronization(unittest.TestCase):
+    def setUp(self):
+        import subprocess
+        self.temp_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.temp_dir, ignore_errors=True))
+        self.repo_dir = Path(self.temp_dir) / "test_repo"
+        self.repo_dir.mkdir(parents=True)
+        # Initialize a real git repo
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(self.repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test Author"], cwd=str(self.repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "author@test.com"], cwd=str(self.repo_dir), check=True, capture_output=True)
+
+        self.manuscript_dir = self.repo_dir / "manuscript"
+        self.manuscript_dir.mkdir()
+        self.chapter_file = self.manuscript_dir / "chapter_01.md"
+        self.chapter_file.write_text(
+            "# 1 | The Awakening\n\n### 1.1 First Dawn\n\nMorning light cracked across the frozen basin.\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=str(self.repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial manuscript commit"], cwd=str(self.repo_dir), check=True, capture_output=True)
+
+        rev_parse = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(self.repo_dir), check=True, capture_output=True, text=True)
+        self.initial_sha = rev_parse.stdout.strip()
+
+        # Initialize StudioDB
+        self.db_path = Path(self.temp_dir) / "studio.sqlite"
+        self.db = StudioDB(str(self.db_path), project_id="git-test-proj")
+        self.db.update_source_metadata(
+            source_root=str(self.repo_dir),
+            source_subpath="manuscript",
+            branch="main",
+            commit_sha=self.initial_sha,
+            source_digest="digest-test",
+            snapshot_path="snap.json",
+            manifest_path="manifest.json",
+            working_tree_dirty=False,
+        )
+        # Import repository
+        self.scenes = self.db.import_repository_scenes([
+            {"path": "manuscript/chapter_01.md", "text": self.chapter_file.read_text(encoding="utf-8")}
+        ])
+
+    def test_git_advanced_detection_blocks_desk_push(self):
+        import subprocess
+        self.assertEqual(len(self.scenes), 1)
+        scene = self.scenes[0]
+
+        # Author in Studio modifies scene in DB
+        self.db.update_scene(scene["scene_number"], "<p>Morning light broke violently across the frozen basin.</p>")
+
+        # Meanwhile, an external commit is made to the git repo touching chapter_01.md
+        self.chapter_file.write_text(
+            "# 1 | The Awakening\n\n### 1.1 First Dawn\n\nExternal collaborator edit.\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "External author commit"], cwd=str(self.repo_dir), check=True, capture_output=True)
+
+        # Attempting desk_push should raise GovernanceError with code 'git_advanced'
+        with self.assertRaises(GovernanceError) as ctx:
+            push_desk_to_git(self.db)
+        self.assertEqual(ctx.exception.code, "git_advanced")
+        self.assertIn("newer commits", str(ctx.exception))
+
+    def test_git_pull_updates_scenes_non_destructively(self):
+        import re
+        import subprocess
+        scene = self.scenes[0]
+        # Find the block id assigned to the paragraph in content_html
+        match = re.search(r'data-id="([^"]+)"', scene["content_html"])
+        paragraph_id = match.group(1) if match else "p-1"
+        if not match:
+            # If no data-id, update scene with an id
+            paragraph_id = "test-para-id"
+            self.db.update_scene(scene["scene_number"], f'<p data-id="{paragraph_id}">Morning light cracked across the frozen basin.</p>')
+
+        # Attach an annotation to scene 1
+        self.db.create_annotation(
+            scene_number=scene["scene_number"],
+            paragraph_id=paragraph_id,
+            quote_text="frozen basin",
+            body="Check historical resonance here.",
+        )
+        annotations_before = self.db.list_annotations(scene["scene_number"])
+        self.assertEqual(len(annotations_before), 1)
+
+        # External author makes a commit
+        self.chapter_file.write_text(
+            "# 1 | The Awakening\n\n### 1.1 First Dawn\n\nExternal updated prose pulled from remote branch.\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "External branch update"], cwd=str(self.repo_dir), check=True, capture_output=True)
+
+        # Pull from git
+        result = pull_desk_from_git(self.db)
+        self.assertEqual(result["status"], "pulled")
+        self.assertEqual(result["total_scenes"], 1)
+
+        # Verify scene was updated in DB
+        updated_scene = self.db.get_scene(scene["scene_number"])
+        self.assertIn("External updated prose pulled from remote branch.", updated_scene["content_html"])
+
+        # Verify annotation was NOT wiped out
+        annotations_after = self.db.list_annotations(scene["scene_number"])
+        self.assertEqual(len(annotations_after), 1)
+        self.assertEqual(annotations_after[0]["body"], "Check historical resonance here.")
+
+        # Verify revision history has git_pull entry
+        history = self.db.scene_history(scene["scene_number"])
+        self.assertTrue(any(rev.get("source") == "git_pull" for rev in history))
+
+    def test_author_direct_commit(self):
+        import subprocess
+        scene = self.scenes[0]
+        self.db.update_scene(scene["scene_number"], "<p>Author typed new direct prose in studio.</p>")
+
+        result = commit_scene_to_git(self.db, scene["scene_number"], message="Author direct commit test")
+        self.assertTrue(result["committed"])
+        self.assertEqual(result["scene_number"], scene["scene_number"])
+
+        # Check git commit log
+        log = subprocess.run(["git", "log", "-1", "--pretty=%B"], cwd=str(self.repo_dir), check=True, capture_output=True, text=True)
+        self.assertIn("Author direct commit test", log.stdout)
+
+        # Check file contents on disk
+        disk_content = self.chapter_file.read_text(encoding="utf-8")
+        self.assertIn("Author typed new direct prose in studio.", disk_content)
 
 
 if __name__ == "__main__":

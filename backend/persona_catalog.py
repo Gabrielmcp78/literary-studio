@@ -18,10 +18,13 @@ from pathlib import Path
 from typing import Any
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_FICTION_GIT_ROOT = PROJECT_ROOT.parent / "fiction-git-system"
+
 FICTION_GIT_SYSTEM_ROOT = Path(
     os.getenv(
         "LITERARY_STUDIO_FICTION_GIT_SYSTEM_ROOT",
-        "/Volumes/Ready500/DEVELOPMENT/fiction-git-system",
+        os.getenv("FICTIONFORCE_ROOT", str(DEFAULT_FICTION_GIT_ROOT)),
     )
 ).expanduser()
 

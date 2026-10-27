@@ -30,11 +30,13 @@ from compiler_engine import (
 from google_docs_export import GoogleDocsExportUnavailable, export_markdown_to_docx
 from governance import (
     GovernanceError,
+    _git,
     commit_batch,
     current_source_state,
     finalize_batch_if_done,
     reconcile_failed_commit_batch,
     record_write,
+    repo_root,
     restore,
     validate_candidate,
     write_back,
@@ -43,7 +45,7 @@ from governance import (
 )
 from mechanical_review import MechanicalReviewError, review_replacements
 from context_package import CONTEXT_OPTIONS, ContextPackageError, build_context_package
-from desk_push import push_desk_to_git
+from desk_push import commit_scene_to_git, pull_desk_from_git, push_desk_to_git
 from intake_audit import run_intake_audit
 from manual_sync import build_manual_change_candidates
 from manuscript_context import (
@@ -73,6 +75,7 @@ from source_repair import (
 from studio_db import (
     PROJECTS_ROOT,
     StudioDB,
+    _markdown_scenes,
     html_to_text,
     load_semantic_style_registry,
     utc_now,
@@ -93,13 +96,19 @@ PROJECT_SUPPORT_SOURCES = {
             "document_key": "string-theories-revision-11-outline",
             "kind": "outline",
             "title": "String Theories — Revision 11 Outline",
-            "source_path": "/Users/gabrielmcp/Downloads/StringTheories_Rev 11_Outline.md",
+            "source_path": os.getenv(
+                "STRING_THEORIES_OUTLINE_PATH",
+                "/Users/gabrielmcp/Downloads/StringTheories_Rev 11_Outline.md",
+            ),
         },
         {
             "document_key": "string-theories-story-beat-cards",
             "kind": "story_beat_cards",
             "title": "String Theories — Story Beat Cards",
-            "source_path": "/Users/gabrielmcp/.gemini/antigravity/brain/7ec44454-a070-498c-b740-a1e9217bee01/scratch/StringTheories_story_beat_cards.json",
+            "source_path": os.getenv(
+                "STRING_THEORIES_BEAT_CARDS_PATH",
+                "/Users/gabrielmcp/.gemini/antigravity/brain/7ec44454-a070-498c-b740-a1e9217bee01/scratch/StringTheories_story_beat_cards.json",
+            ),
         },
     ]
 }
@@ -277,6 +286,16 @@ class DeskPushRequest(BaseModel):
     allow_unsafe: bool = False
     # Explicit author override for a pre-existing dirty worktree. This still
     # commits only files changed by the saved Studio desk.
+    override_dirty: bool = False
+
+
+class GitPullRequest(BaseModel):
+    pull_remote: bool = False
+    override_dirty: bool = False
+
+
+class DirectCommitRequest(BaseModel):
+    message: str | None = None
     override_dirty: bool = False
 
 
@@ -2008,6 +2027,85 @@ def push_manual_changes(project_id: str, req: DeskPushRequest):
     except (GovernanceError, SnapshotError) as exc:
         status = 409 if isinstance(exc, GovernanceError) else 400
         raise HTTPException(status_code=status, detail={"code": getattr(exc, "code", "snapshot_error"), "message": str(exc)}) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to refresh source provenance: {exc}") from exc
+
+
+@app.post("/api/projects/{project_id}/git-pull")
+def pull_project_from_git(project_id: str, req: GitPullRequest | None = None):
+    """Pull source Markdown changes from the linked Git worktree into Studio SQLite cache non-destructively."""
+    db = get_project_db(project_id)
+    req = req or GitPullRequest()
+    try:
+        result = pull_desk_from_git(
+            db,
+            pull_remote=req.pull_remote,
+            override_dirty=req.override_dirty,
+        )
+        project = db.project_info()
+        snapshot = build_snapshot(
+            project["project_id"],
+            project["title"],
+            project["source_root"],
+            project.get("source_subpath"),
+        )
+        output_dir = PROJECTS_ROOT / project["project_id"] / "source"
+        snapshot_path, manifest_path = write_snapshot(snapshot, output_dir)
+        result["project"] = db.update_source_metadata(
+            source_root=snapshot["manifest"]["source_root"],
+            source_subpath=snapshot["manifest"]["source_subpath"],
+            branch=snapshot["manifest"]["branch"],
+            commit_sha=snapshot["manifest"]["commit_sha"],
+            source_digest=snapshot["manifest"]["source_digest"],
+            snapshot_path=str(snapshot_path),
+            manifest_path=str(manifest_path),
+            working_tree_dirty=snapshot["manifest"]["working_tree_dirty"],
+        )
+        result["graph"] = db.rebuild_story_graph()
+        return result
+    except (GovernanceError, SnapshotError) as exc:
+        status = 409 if isinstance(exc, GovernanceError) else 400
+        raise HTTPException(status_code=status, detail={"code": getattr(exc, "code", "git_error"), "message": str(exc)}) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to refresh source provenance: {exc}") from exc
+
+
+@app.post("/api/projects/{project_id}/scenes/{scene_number}/direct-commit")
+def direct_commit_scene(project_id: str, scene_number: int, req: DirectCommitRequest | None = None):
+    """Author direct commit of a single scene directly to Git without proposal batching."""
+    db = get_project_db(project_id)
+    req = req or DirectCommitRequest()
+    try:
+        result = commit_scene_to_git(
+            db,
+            scene_number,
+            message=req.message,
+            override_dirty=req.override_dirty,
+        )
+        if result.get("committed"):
+            project = db.project_info()
+            snapshot = build_snapshot(
+                project["project_id"],
+                project["title"],
+                project["source_root"],
+                project.get("source_subpath"),
+            )
+            output_dir = PROJECTS_ROOT / project["project_id"] / "source"
+            snapshot_path, manifest_path = write_snapshot(snapshot, output_dir)
+            result["project"] = db.update_source_metadata(
+                source_root=snapshot["manifest"]["source_root"],
+                source_subpath=snapshot["manifest"]["source_subpath"],
+                branch=snapshot["manifest"]["branch"],
+                commit_sha=snapshot["manifest"]["commit_sha"],
+                source_digest=snapshot["manifest"]["source_digest"],
+                snapshot_path=str(snapshot_path),
+                manifest_path=str(manifest_path),
+                working_tree_dirty=snapshot["manifest"]["working_tree_dirty"],
+            )
+        return result
+    except (GovernanceError, SnapshotError) as exc:
+        status = 409 if isinstance(exc, GovernanceError) else 400
+        raise HTTPException(status_code=status, detail={"code": getattr(exc, "code", "git_error"), "message": str(exc)}) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Unable to refresh source provenance: {exc}") from exc
 

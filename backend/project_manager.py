@@ -31,9 +31,12 @@ from uuid import uuid4
 from studio_db import PROJECTS_ROOT, StudioDB
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_FICTION_GIT_ROOT = PROJECT_ROOT.parent / "fiction-git-system"
+
 PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 FICTIONFORCE_CONFIG = Path(
-    os.getenv("FICTIONFORCE_CONFIG", "/Volumes/Ready500/DEVELOPMENT/fiction-git-system/fiction.config.json")
+    os.getenv("FICTIONFORCE_CONFIG") or str(DEFAULT_FICTION_GIT_ROOT / "fiction.config.json")
 )
 
 

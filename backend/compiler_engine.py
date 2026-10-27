@@ -166,10 +166,29 @@ def _load_typesetter() -> tuple[Any, Any, Any]:
     return export_latex, compile_latex_pdf, list_format_profiles
 
 
+DEFAULT_FORMAT_PROFILES: list[dict[str, str]] = [
+    {
+        "id": "manuscript_submission",
+        "label": "Manuscript Submission (Standard Shunn)",
+        "target": "latex",
+        "description": "Letter-size editorial submission profile with one-inch margins, simple headers, and double-spaced prose.",
+    },
+    {
+        "id": "trade_paperback_prh",
+        "label": "Trade Paperback Literary",
+        "target": "latex",
+        "description": "Six-by-nine literary trade paperback profile with house-style title pages, bottom outside folios, drop caps, scene rules, and font fallback.",
+    },
+]
+
+
 def list_format_profiles() -> list[dict[str, str]]:
     """Expose the authoritative LaTeX profiles to the Studio UI."""
-    _, _, list_profiles = _load_typesetter()
-    return [profile for profile in list_profiles() if profile.get("target") == "latex"]
+    try:
+        _, _, list_profiles = _load_typesetter()
+        return [profile for profile in list_profiles() if profile.get("target") == "latex"]
+    except FormatterUnavailable:
+        return DEFAULT_FORMAT_PROFILES
 
 
 def _safe_filename(value: str) -> str:
@@ -320,23 +339,34 @@ def _provenance_frontmatter(provenance: Mapping[str, Any] | None) -> list[str]:
 def _scene_heading_text(scene: Mapping[str, Any]) -> str:
     """Return the formatter's structured scene heading for one scene.
 
-    Scene titles in the Studio may already contain formatter metadata such as
-    ``SUBJECT | Buffalo, NY | Present Day``. Prefixing the local scene ordinal
-    preserves that metadata while giving the Fiction Git Studio parser the
-    numeric scene id it needs to render a real scene heading. A blank or
-    generic ``Scene N`` title is intentionally not promoted to a heading: the
-    chapter opener or a plain scene break is the only honest output in that
-    case.
+    Preserves chapter-scene hierarchy (e.g. 6.1) and compound literary headers
+    (SUBJECT | Location | Timeline) for exact alignment with the Typeset Exporter
+    and SCENE_HEADING_RE parser.
     """
     label = str(scene.get("title") or "").strip()
     if not label or re.fullmatch(r"scene\s+\d+", label, flags=re.IGNORECASE):
         return ""
+
+    chapter_num = scene.get("chapter_number")
     ordinal = scene.get("scene_number_in_chapter")
+
+    clean_label = label.replace("--", "—")
+    clean_label = re.sub(r"^\d+(?:\.\d+)?\s*[|—–:-]?\s*", "", clean_label).strip()
+
     try:
-        ordinal_text = str(int(ordinal))
+        ord_int = int(ordinal)
+        if chapter_num not in (None, "", 0):
+            prefix = f"{int(chapter_num)}.{ord_int}"
+        else:
+            prefix = f"{ord_int}"
     except (TypeError, ValueError):
-        ordinal_text = ""
-    return f"{ordinal_text} | {label.replace('--', '—')}" if ordinal_text else label.replace('--', '—')
+        prefix = ""
+
+    if prefix and clean_label:
+        return f"{prefix}  {clean_label}"
+    if prefix:
+        return prefix
+    return clean_label
 
 
 def render_markdown_export(

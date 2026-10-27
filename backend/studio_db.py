@@ -535,7 +535,10 @@ def _render_markdown_body(body_text: str) -> str:
 
 def _chapter_number(value: str) -> int | None:
     match = re.search(r"(?:chapter|ch)[\s._-]*(\d+)", value, flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    if match:
+        return int(match.group(1))
+    match_leading = re.match(r"^\s*(\d+)\s*[|—:-]", value)
+    return int(match_leading.group(1)) if match_leading else None
 
 
 def _part_metadata(act_title: str | None) -> tuple[int | None, str | None]:
@@ -576,7 +579,8 @@ def _markdown_scenes(path: str, text: str) -> list[ImportedSection]:
         None,
     )
     chapter_number = _chapter_number(file_title) or _chapter_number(filename)
-    chapter_title = f"{act_title} / {file_title}" if act_title else file_title
+    clean_title = re.sub(r"^\d+\s*[|—:-]\s*", "", file_title).strip() or file_title
+    chapter_title = f"{act_title} / {clean_title}" if act_title else clean_title
     part_number, part_title = _part_metadata(act_title)
     numbered_scene_heading = re.compile(
         r"^\s*###\s+(\d+)\.(\d+)\s+(.+?)\s*$",
@@ -717,6 +721,9 @@ class StudioDB:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA synchronous = NORMAL")
         try:
             yield connection
         except BaseException:
@@ -2428,7 +2435,12 @@ class StudioDB:
         return [self.get_scene(scene_number) for scene_number in imported_numbers]  # type: ignore[misc]
 
     def replace_imported_file(
-        self, source_path: str, sections: list[ImportedSection]
+        self,
+        source_path: str,
+        sections: list[ImportedSection],
+        *,
+        source: str = "source_repair",
+        summary: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[int]]:
         """Replace one file's imported scene roster without touching other files.
 
@@ -2439,6 +2451,8 @@ class StudioDB:
         must perform its hash check first.
         """
         normalized_path = source_path.replace("\\", "/").strip("/")
+        effective_summary = summary or f"Recompiled source file {normalized_path}"
+        effective_telemetry = "git_pull_sync" if source == "git_pull" else "source_recompiled"
         with self._lock, self._connect() as connection:
             existing_rows = connection.execute(
                 """SELECT * FROM scenes WHERE source_path = ?
@@ -2491,8 +2505,8 @@ class StudioDB:
                             scene_number,
                             version,
                             section.content_html,
-                            f"Recompiled source file {normalized_path}",
-                            "source_repair",
+                            effective_summary,
+                            source,
                             now,
                         ),
                     )
@@ -2526,8 +2540,8 @@ class StudioDB:
                         (
                             scene_number,
                             section.content_html,
-                            f"Recompiled source file {normalized_path}",
-                            "source_repair",
+                            effective_summary,
+                            source,
                             now,
                         ),
                     )
@@ -2535,8 +2549,8 @@ class StudioDB:
                 connection.execute(
                     """INSERT INTO telemetry_events(
                        scene_number, event_type, words_added, words_deleted, summary, created_at
-                       ) VALUES (?, 'source_recompiled', 0, 0, ?, ?)""",
-                    (scene_number, f"Recompiled {normalized_path}", now),
+                       ) VALUES (?, ?, 0, 0, ?, ?)""",
+                    (scene_number, effective_telemetry, f"{effective_summary} (v{section.title})", now),
                 )
 
             removed_scene_numbers = [

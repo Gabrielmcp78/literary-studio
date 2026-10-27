@@ -54,8 +54,11 @@ from studio_db import StudioDB, html_to_text, is_project_local_scratch_path, uni
 from compiler_engine import html_to_markdown
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_FICTION_GIT_ROOT = PROJECT_ROOT.parent / "fiction-git-system"
+
 FICTIONFORCE_ROOT = Path(
-    os.getenv("FICTIONFORCE_ROOT", "/Volumes/Ready500/DEVELOPMENT/fiction-git-system")
+    os.getenv("FICTIONFORCE_ROOT") or str(DEFAULT_FICTION_GIT_ROOT)
 )
 GIT_TIMEOUT_SECONDS = 60
 BALANCED_PAIRS = (("“", "”"), ("(", ")"), ("[", "]"))
@@ -207,17 +210,34 @@ def current_source_state(db: StudioDB) -> dict[str, Any]:
     return state
 
 
+def _is_relevant_manuscript_change(path_str: str) -> bool:
+    clean = path_str.strip().strip('"').strip("'")
+    if clean.endswith(".DS_Store") or clean.endswith("Thumbs.db"):
+        return False
+    if any(part in clean for part in ("build_artifacts", ".runtime", "node_modules", ".next", ".git", ".vscode")):
+        return False
+    if "/scratch/" in clean or clean.startswith("scratch/"):
+        return False
+    return True
+
+
 def source_worktree_status(db: StudioDB) -> dict[str, Any]:
     """Return a read-only, file-level view of the configured source checkout."""
     project = db.project_info()
     root = repo_root(project.get("source_root"))
-    raw = _git(root, "status", "--porcelain=v1", "--untracked-files=all")
+    subpath = (project.get("source_subpath") or "").strip()
+    status_args = ["status", "--porcelain=v1", "--untracked-files=all"]
+    if subpath:
+        status_args.extend(["--", subpath])
+    raw = _git(root, *status_args)
     files: list[dict[str, Any]] = []
     for line in raw.splitlines():
         if len(line) < 3:
             continue
         code = line[:2]
-        path = line[3:]
+        path = line[3:].strip()
+        if not _is_relevant_manuscript_change(path):
+            continue
         staged = code[0] not in {" ", "?"}
         unstaged = code[1] not in {" ", "?"}
         untracked = code == "??"
@@ -765,12 +785,19 @@ def reconcile_failed_commit_batch(db: StudioDB, batch_id: str) -> dict[str, Any]
             raise GovernanceError(f"Recorded source file is unavailable: {relative}", "reconcile_unsafe")
         source_by_path[relative] = target.read_text(encoding="utf-8")
 
+    project = db.project_info()
     for proposal in batch.get("proposals", []):
         if proposal.get("status") != "accepted":
             continue
         replacement = proposal.get("proposed_replacement_text", "")
         scene = db.get_scene(int(proposal["scene_number"]))
-        relative = scene.get("source_path") if scene else None
+        # Imported scenes may retain a project-folder prefix in source_path
+        # (for example ``string-theories-v11/manuscript/...``), while the
+        # failed-batch ledger records the Git-relative path. Resolve through
+        # the same source boundary helper used by write-back so reconciliation
+        # compares the approved text against the correct clean file.
+        located = source_file(project, scene) if scene else None
+        relative = located[1] if located else None
         if not relative or relative not in source_by_path or replacement not in source_by_path[relative]:
             raise GovernanceError(
                 "The exact approved replacement is not present in the clean source; re-prepare the change.",
