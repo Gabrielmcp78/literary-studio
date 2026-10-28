@@ -240,7 +240,13 @@ SOURCE-PINNED SCENE EVIDENCE:
         }
         for item in candidates_for_mechanical_review
     ]
-    mechanical: dict[str, Any] = {"provider": None, "model": None, "fallback_reasons": [], "items": {}}
+    mechanical: dict[str, Any] = {
+        "provider": None,
+        "model": None,
+        "fallback_reasons": [],
+        "items": {},
+        "status": "not_run",
+    }
     if mechanical_items:
         try:
             mechanical_allowed_providers = allowed_providers or ("gemini", "agy")
@@ -249,19 +255,28 @@ SOURCE-PINNED SCENE EVIDENCE:
                 allowed_providers=mechanical_allowed_providers,
                 preferred_provider=preferred_provider or os.getenv("LITERARY_STUDIO_EDITORIAL_PROVIDER", "auto"),
             )
+            mechanical["status"] = "completed"
         except MechanicalReviewError as exc:
-            for item in candidates_for_mechanical_review:
-                rejected.append({
-                    "candidate": item["candidate"],
-                    "reason": f"Mechanical spelling and copy-edit pass failed closed: {exc}",
-                })
-            candidates_for_mechanical_review = []
+            # Mechanical review is an advisory copy-edit pass.  Model
+            # unavailability (and other pass-level failures) must not prevent
+            # an otherwise governance-valid proposal reaching the author desk.
+            # Keep the AI's proposed text unchanged and surface the failure in
+            # both validation and batch provenance.
+            mechanical["status"] = "unavailable"
+            mechanical["fallback_reasons"] = [f"Mechanical review did not run: {exc}"]
 
     for item in candidates_for_mechanical_review:
         candidate = item["candidate"]
         scene = item["scene"]
         original = item["original"]
-        reviewed = mechanical["items"][item["id"]]
+        reviewed = mechanical["items"].get(item["id"])
+        if reviewed is None:
+            reviewed = {
+                "replacement_text": item["replacement"],
+                "issues": [],
+                "changed": False,
+                "status": "unavailable",
+            }
         replacement = reviewed["replacement_text"]
         if not replacement.strip() or original == replacement:
             rejected.append({
@@ -277,8 +292,13 @@ SOURCE-PINNED SCENE EVIDENCE:
             "fallback_reasons": mechanical["fallback_reasons"],
             "issues": reviewed["issues"],
             "changed": reviewed["changed"],
-            "applied_correction": True,
+            "status": mechanical["status"],
+            "applied_correction": mechanical["status"] == "completed",
         }
+        if mechanical["status"] == "unavailable":
+            validation["warnings"].append(
+                "Mechanical spelling and copy-edit pass did not run; the original proposal was submitted unchanged for author review."
+            )
         if reviewed["issues"]:
             validation["warnings"].extend(
                 f"Mechanical pass: {issue['description']}" for issue in reviewed["issues"]
@@ -321,7 +341,9 @@ SOURCE-PINNED SCENE EVIDENCE:
                 "provider": mechanical["provider"],
                 "model": mechanical["model"],
                 "fallback_reasons": mechanical["fallback_reasons"],
-                "required": True,
+                "status": mechanical["status"],
+                "required": False,
+                "advisory": True,
             },
         },
     }

@@ -46,7 +46,7 @@ def ai_classify_file(relative_path: str, preview_text: str) -> str:
 You are an expert editorial manuscript intake analyzer.
 Analyze this file path and excerpt from an author's repository.
 Determine if this file is:
-1. "manuscript" — actual fiction story prose (novel chapters, scenes, prologue, epilogue, appendix story text).
+1. "manuscript" — actual fiction story prose (novel chapters, scenes, epigraph, prologue, epilogue, appendix story text).
 2. "support" — authorial planning material, outlines, beat cards, worldbook lore, character dossiers, or editorial critique notes.
 3. "ignored" — build artifacts, system files, test logs, licenses.
 

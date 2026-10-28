@@ -92,7 +92,7 @@ def _single_or_break_split_scene_span(
         return None
 
     # This mirrors _markdown_scenes: remove frontmatter, then remove the first
-    # level-one file title. Prologues may have no title heading; appendices use
+    # level-one file title. Opening matter may have no title heading; appendices use
     # an ``# Appendix | ...`` title instead of a numeric one.
     frontmatter = re.match(r"^---\s*\n.*?\n---\s*\n", source, flags=re.DOTALL)
     start = frontmatter.end() if frontmatter else 0

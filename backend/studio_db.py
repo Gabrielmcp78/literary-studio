@@ -547,7 +547,7 @@ def _part_metadata(act_title: str | None) -> tuple[int | None, str | None]:
     if not match:
         return None, None
     number = int(match.group(1))
-    return number, "Prologue" if number == 0 else f"Part {number}"
+    return number, "Epigraph" if number == 0 else f"Part {number}"
 
 
 def _markdown_scenes(path: str, text: str) -> list[ImportedSection]:
@@ -580,6 +580,8 @@ def _markdown_scenes(path: str, text: str) -> list[ImportedSection]:
     )
     chapter_number = _chapter_number(file_title) or _chapter_number(filename)
     clean_title = re.sub(r"^\d+\s*[|—:-]\s*", "", file_title).strip() or file_title
+    if chapter_number == 0:
+        clean_title = "Epigraph"
     chapter_title = f"{act_title} / {clean_title}" if act_title else clean_title
     part_number, part_title = _part_metadata(act_title)
     numbered_scene_heading = re.compile(
@@ -968,7 +970,7 @@ class StudioDB:
                         (part_number, f"Part {part_number}", legacy_row["scene_number"]),
                     )
             connection.execute(
-                "UPDATE scenes SET part_title = 'Prologue' WHERE part_number = 0 AND part_title = 'Part 0'"
+                "UPDATE scenes SET part_title = 'Epigraph' WHERE part_number = 0 AND part_title IN ('Part 0', 'Prologue')"
             )
             connection.execute(
                 """UPDATE scenes

@@ -236,7 +236,7 @@ def _chapter_sort_key(scene: Mapping[str, Any], fallback: int) -> tuple[int, int
     try:
         number = int(chapter_number)
     except (TypeError, ValueError):
-        number = 0 if "prologue" in str(scene.get("chapter_title", "")).casefold() else 9999
+        number = 0 if any(term in str(scene.get("chapter_title", "")).casefold() for term in ("epigraph", "prologue")) else 9999
     title = str(scene.get("chapter_title") or "")
     act_match = re.search(r"act[-_ ](\d+)", title, flags=re.IGNORECASE)
     act = int(act_match.group(1)) if act_match else fallback
@@ -469,14 +469,16 @@ def _write_project_chapters(scenes: list[Mapping[str, Any]], source_dir: Path) -
     for index, key in enumerate(ordered_keys):
         chapter_number, raw_title = key
         chapter_title = _display_chapter_title(raw_title)
-        is_prologue = "prologue" in chapter_title.casefold() or (chapter_number is None and index == 0)
+        is_epigraph = "epigraph" in chapter_title.casefold()
+        is_prologue = "prologue" in chapter_title.casefold()
+        is_opening_matter = is_epigraph or is_prologue or (chapter_number is None and index == 0)
         try:
             chapter_num = int(chapter_number)
         except (TypeError, ValueError):
-            chapter_num = 0 if is_prologue else index + 1
+            chapter_num = 0 if is_opening_matter else index + 1
         act_match = re.search(r"act[-_ ](\d+)", raw_title, flags=re.IGNORECASE)
-        act_number = int(act_match.group(1)) if act_match else (0 if is_prologue else chapter_num)
-        chapter_id = f"ch{chapter_num:02d}-{'prologue' if is_prologue else _safe_filename(chapter_title)}"
+        act_number = int(act_match.group(1)) if act_match else (0 if is_opening_matter else chapter_num)
+        chapter_id = f"ch{chapter_num:02d}-{'epigraph' if is_epigraph else ('prologue' if is_prologue else _safe_filename(chapter_title))}"
         path = source_dir / f"{chapter_id}.md"
         lines = [
             "---",
