@@ -1048,9 +1048,20 @@ SELECTED PASSAGE (exact text supplied by the author; prioritize this passage whe
         "No project support documents are registered for this manuscript."
     )
     target_label = scope_label or f"Scene {scene_number}"
+    if persona.get("category") == "beta_reader":
+        role_header = (
+            f"You are a dedicated target-audience beta reader simulator roleplaying as '{persona['name']}'.\n"
+            f"Stay strictly inside your reader avatar profile, demographic background ({persona.get('organization_or_imprint')}), "
+            "reading diet, and psychographic expectations. Evaluate how this text resonates with you as an avid reader."
+        )
+    else:
+        role_header = (
+            "You are one independent editorial simulator in a multi-persona literary panel.\n"
+            "Do not imitate or claim to be a real person. Stay inside this role's dossier."
+        )
+
     prompt = f"""
-You are one independent editorial simulator in a multi-persona literary panel.
-Do not imitate or claim to be a real person. Stay inside this role's dossier.
+{role_header}
 Evaluate {target_label} only, applying the author's focus below. If the scope is
 'selection', constrain close-reading and quote anchors to the selected passage while
 using the rest of the scene only for necessary context. If the scope is 'chapter', you have the complete
@@ -1452,10 +1463,22 @@ def interrogation_chat_endpoint(project_id: str, req: InterrogationRequest):
     persona = get_persona(req.persona_id)
     if persona is None:
         raise HTTPException(status_code=404, detail="Persona not found.")
+    if persona.get("category") == "beta_reader":
+        role_intro = (
+            f"You are an avid, highly engaged target-audience beta reader roleplaying as '{persona['name']}'. "
+            f"Demographic background: {persona.get('organization_or_imprint', '')}.\n"
+            "You are having an authentic, candid literary conversation with the author about their manuscript. "
+            "Speak from your authentic reader perspective, bringing your domain sensitivities, reading diet, and psychographic reactions to life."
+        )
+    else:
+        role_intro = (
+            f"You are a profile-informed editorial simulator for {persona['name']}, based on a "
+            "source dossier from the Fiction Git System. This is a simulation, not a claim that "
+            "the real person reviewed the manuscript."
+        )
+
     system_instruction = (
-        f"You are a profile-informed editorial simulator for {persona['name']}, based on a "
-        f"source dossier from the Fiction Git System. This is a simulation, not a claim that "
-        "the real person reviewed the manuscript.\n\n"
+        f"{role_intro}\n\n"
         "MANDATORY EDITORIAL DIRECTIVES:\n"
         "1. You are actively reading the author's manuscript prose provided in the context below.\n"
         "2. Base all your reactions, thoughts, dialogue, critiques, and roleplay on the ACTUAL MANUSCRIPT TEXT — "

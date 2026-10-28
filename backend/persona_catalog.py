@@ -33,6 +33,8 @@ AGENT_PROFILE_FILES = (
     "fiction_git_system/Top 21-40 agents for string theory_done.json",
 )
 EDITOR_PROFILE_FILE = "fiction_git_system/Prestige NYC Editors.json"
+BETA_READER_PROFILE_FILE = "fiction_git_system/Beta Reader Profiles.json"
+LOCAL_BETA_READER_PROFILE_FILE = PROJECT_ROOT / "backend" / "data" / "beta_reader_profiles.json"
 CAST_INDEX_FILE = "fiction_git_system/cast/index.json"
 SPECIALIST_ROSTER_FILE = ".github/agents/roster.json"
 AUTHOR_PROFILE_GIT_REF = os.getenv(
@@ -139,6 +141,32 @@ def _specialist_persona(entry: dict[str, Any], root: Path) -> dict[str, Any] | N
         "red_flags": [],
         "profile_context": source_material,
         **_source_metadata(relative_path, path),
+    }
+
+
+def _beta_reader_persona(profile: dict[str, Any], index: int, source: dict[str, str]) -> dict[str, Any]:
+    archetype = profile.get("archetype", f"Beta Reader {index}")
+    demographics = profile.get("demographics", {})
+    age_range = demographics.get("age_range", "Adult")
+    background = demographics.get("background", "General readership")
+    reading_diet = profile.get("reading_diet", [])
+    psychographics = profile.get("psychographics_and_appeal", "Profile-informed beta reader simulation.")
+    green_flags = profile.get("green_flags", [])
+    red_flags = profile.get("red_flags", [])
+
+    return {
+        "persona_id": f"beta_reader_{index:02d}_{_slug(archetype)}",
+        "name": archetype,
+        "category": "beta_reader",
+        "role": "reader",
+        "title_or_archetype": archetype,
+        "organization_or_imprint": f"{age_range} · {background}",
+        "taste_summary": psychographics,
+        "focus": f"Reading Diet: {', '.join(reading_diet)}. Appeal: {psychographics}",
+        "green_flags": green_flags,
+        "red_flags": red_flags,
+        "profile_context": _json_profile_context(profile),
+        **source,
     }
 
 
@@ -291,12 +319,22 @@ def _load_catalog() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[st
         return _empty_catalog()
 
     personas: list[dict[str, Any]] = []
+    beta_reader_ids: list[str] = []
     literary_agent_ids: list[str] = []
     editor_ids: list[str] = []
     craft_ids: list[str] = []
     author_ids: list[str] = []
     specialist_ids: list[str] = []
     warnings: list[str] = []
+
+    beta_path = FICTION_GIT_SYSTEM_ROOT / BETA_READER_PROFILE_FILE
+    if not beta_path.is_file() and LOCAL_BETA_READER_PROFILE_FILE.is_file():
+        beta_path = LOCAL_BETA_READER_PROFILE_FILE
+    beta_payload = _load_json(beta_path, warnings)
+    for index, profile in enumerate(beta_payload.get("beta_reader_profiles", []), start=1):
+        persona = _beta_reader_persona(profile, index, _source_metadata(str(beta_path.name), beta_path))
+        personas.append(persona)
+        beta_reader_ids.append(persona["persona_id"])
 
     for batch, relative_path in enumerate(AGENT_PROFILE_FILES, start=1):
         path = FICTION_GIT_SYSTEM_ROOT / relative_path
@@ -417,6 +455,13 @@ def _load_catalog() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[st
             "source_file": "fiction_git_system/cast/group/fiction_editor_roundtable.md",
         },
         {
+            "panel_id": "beta_readers",
+            "name": "Beta Reader Avatars",
+            "description": "10 target audience beta reader avatar profiles spanning speculative fiction, classical music, acoustics, physics, puzzle-box mysteries, philosophy of mind, literary purism, theater dramaturgs, systems architecture, and upmarket book club leaders.",
+            "persona_ids": beta_reader_ids,
+            "source_file": BETA_READER_PROFILE_FILE,
+        },
+        {
             "panel_id": "all_editors",
             "name": "All 15 Prestige Editors",
             "description": "Every editor profile from Prestige NYC Editors.json.",
@@ -468,6 +513,7 @@ def _load_catalog() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[st
     ]
     summary = {
         "total_profiles": len(personas),
+        "beta_readers": len(beta_reader_ids),
         "literary_agents": len(literary_agent_ids),
         "prestige_editors": len(editor_ids),
         "craft_agents": len(craft_ids),
