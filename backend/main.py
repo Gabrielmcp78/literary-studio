@@ -11,6 +11,16 @@ from config import load_environment
 
 load_environment()
 
+# Ensure standard TeX binaries and Homebrew paths are in PATH on macOS
+for _bin_dir in (
+    "/Library/TeX/texbin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+):
+    if os.path.isdir(_bin_dir) and _bin_dir not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = f"{_bin_dir}:{os.environ.get('PATH', '')}"
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
