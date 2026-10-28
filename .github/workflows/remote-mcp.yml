@@ -1,0 +1,29 @@
+name: Literary Studio Remote MCP
+on:
+  pull_request:
+    paths:
+      - "backend/mcp_http_server.py"
+      - "backend/mcp_server.py"
+      - "backend/test_mcp_http_server.py"
+      - "backend/requirements.txt"
+      - ".github/workflows/remote-mcp.yml"
+  push:
+    branches: ["feature/studio-remote-mcp-transport"]
+    paths:
+      - "backend/mcp_http_server.py"
+      - "backend/mcp_server.py"
+      - "backend/test_mcp_http_server.py"
+      - "backend/requirements.txt"
+      - ".github/workflows/remote-mcp.yml"
+jobs:
+  remote-mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal runtime dependencies
+        run: python -m pip install fastapi==0.162.0 uvicorn==0.54.0
+      - name: Run MCP transport unit tests
+        run: cd backend && python -m unittest -v test_mcp_http_server
