@@ -67,5 +67,51 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("studio_commit", names)
 
 
+
+class HttpEndpointTests(unittest.TestCase):
+    def _request(self, secret, authorization=None):
+        import asyncio
+        from mcp_http_server import app
+        body = json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}}).encode()
+        headers = [(b"content-type", b"application/json"), (b"accept", b"application/json, text/event-stream")]
+        if authorization is not None:
+            headers.append((b"authorization", authorization.encode()))
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "scheme": "http", "method": "POST", "path": "/mcp",
+            "raw_path": b"/mcp", "query_string": b"", "root_path": "",
+            "headers": headers, "server": ("127.0.0.1", 8794),
+            "client": ("127.0.0.1", 10000),
+        }
+        events = []
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            events.append(message)
+
+        with patch.dict(os.environ, {"LITERARY_STUDIO_MCP_TOKEN": secret}):
+            asyncio.run(app(scope, receive, send))
+        status = next(e["status"] for e in events if e["type"] == "http.response.start")
+        response = b"".join(e.get("body", b"") for e in events if e["type"] == "http.response.body")
+        return status, response
+
+    def test_http_denies_missing_bearer(self):
+        status, _ = self._request("a" * 64)
+        self.assertEqual(status, 401)
+
+    def test_http_serves_existing_tools_with_bearer(self):
+        secret = "a" * 64
+        status, body = self._request(secret, "Bearer " + secret)
+        self.assertEqual(status, 200)
+        self.assertIn("studio_read_scene", body.decode())
+
+
 if __name__ == "__main__":
     unittest.main()
